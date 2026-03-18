@@ -222,9 +222,8 @@ def make_simple_table(df, var_name, meta, col_map, weight_col=None):
 def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
     """
     Tip 'k'/'d': Multiple response tablica.
-    Replicira: TABLES /MRGROUP|MDGROUP $e1 '' var1 var2 ...
-               /GBASE=CASES /TABLE=$e1+$t BY (STATISTICS)
-               /STATISTICS count($e1(F5.0) 'n') cpct($e1(F6.1) '%')
+    'd' (MDGROUP): svaka varijabla = 1 red, label = variable label
+    'k' (MRGROUP): redovi = unique value labels across all variables
     """
     var_names_raw = parse_mr_vars(var_string)
     var_names = [resolve_col(v, df, col_map) for v in var_names_raw]
@@ -240,15 +239,43 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
         total_cases = int(valid_mask.sum())
 
     rows = []
-    for vname in var_names:
-        label = get_var_label(vname, meta)
-        mask = df[vname].notna() & (df[vname] != 0)
-        if use_weight:
-            n = float(df.loc[mask, weight_col].sum())
-        else:
-            n = int(mask.sum())
-        pct = round(float(n) / float(total_cases) * 100, 1) if total_cases > 0 else 0.0
-        rows.append((str(label), round(float(n), 1), pct))
+
+    if mr_type == 'k':
+        # MRGROUP: rows = unique values, labels = value labels
+        # Collect all unique values across all k-variables
+        all_vals = set()
+        for vname in var_names:
+            all_vals.update(df[vname].dropna().unique())
+        all_vals.discard(0)
+        all_vals = sorted(all_vals,
+                          key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
+
+        # Value labels from first variable (they all share the same)
+        vlabels = get_value_labels(var_names[0], meta)
+
+        for val in all_vals:
+            label = label_for_value(val, vlabels)
+            # Count respondents who have this value in ANY of the variables
+            mask = pd.Series(False, index=df.index)
+            for vname in var_names:
+                mask = mask | (df[vname] == val)
+            if use_weight:
+                n = float(df.loc[mask, weight_col].sum())
+            else:
+                n = int(mask.sum())
+            pct = round(float(n) / float(total_cases) * 100, 1) if total_cases > 0 else 0.0
+            rows.append((str(label), round(float(n), 1), pct))
+    else:
+        # MDGROUP ('d'): rows = variables, labels = variable labels
+        for vname in var_names:
+            label = get_var_label(vname, meta)
+            mask = df[vname].notna() & (df[vname] != 0)
+            if use_weight:
+                n = float(df.loc[mask, weight_col].sum())
+            else:
+                n = int(mask.sum())
+            pct = round(float(n) / float(total_cases) * 100, 1) if total_cases > 0 else 0.0
+            rows.append((str(label), round(float(n), 1), pct))
 
     rows.append(('Total*', round(float(total_cases), 1), ''))
 
@@ -651,27 +678,63 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
     else:
         col_ns.append(len(subset))
 
-    row_labels = [get_var_label(v, meta) for v in var_names]
-    pct_matrix = []
-    for vname in var_names:
-        row_pcts = []
-        item_mask = subset[vname].notna() & (subset[vname] != 0)
-        for ci, bv in enumerate(break_vals):
-            combined = item_mask & (subset[actual_break] == bv)
+    if mr_type == 'k':
+        # MRGROUP: rows = unique values across all variables
+        all_vals = set()
+        for vname in var_names:
+            all_vals.update(subset[vname].dropna().unique())
+        all_vals.discard(0)
+        all_vals = sorted(all_vals,
+                          key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
+        vlabels = get_value_labels(var_names[0], meta)
+        row_labels = [label_for_value(val, vlabels) for val in all_vals]
+
+        pct_matrix = []
+        for val in all_vals:
+            row_pcts = []
+            # Respondent has this value in ANY of the variables
+            item_mask = pd.Series(False, index=subset.index)
+            for vname in var_names:
+                item_mask = item_mask | (subset[vname] == val)
+            for ci, bv in enumerate(break_vals):
+                combined = item_mask & (subset[actual_break] == bv)
+                if use_weight:
+                    n = float(subset.loc[combined, weight_col].sum())
+                else:
+                    n = int(combined.sum())
+                pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
+                row_pcts.append(pct)
+            # Total
             if use_weight:
-                n = float(subset.loc[combined, weight_col].sum())
+                n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
-                n = int(combined.sum())
-            pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
-            row_pcts.append(pct)
-        # Total
-        if use_weight:
-            n_total = float(subset.loc[item_mask, weight_col].sum())
-        else:
-            n_total = int(item_mask.sum())
-        pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
-        row_pcts.append(pct_total)
-        pct_matrix.append(row_pcts)
+                n_total = int(item_mask.sum())
+            pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
+            row_pcts.append(pct_total)
+            pct_matrix.append(row_pcts)
+    else:
+        # MDGROUP ('d'): rows = variables, labels = variable labels
+        row_labels = [get_var_label(v, meta) for v in var_names]
+        pct_matrix = []
+        for vname in var_names:
+            row_pcts = []
+            item_mask = subset[vname].notna() & (subset[vname] != 0)
+            for ci, bv in enumerate(break_vals):
+                combined = item_mask & (subset[actual_break] == bv)
+                if use_weight:
+                    n = float(subset.loc[combined, weight_col].sum())
+                else:
+                    n = int(combined.sum())
+                pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
+                row_pcts.append(pct)
+            # Total
+            if use_weight:
+                n_total = float(subset.loc[item_mask, weight_col].sum())
+            else:
+                n_total = int(item_mask.sum())
+            pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
+            row_pcts.append(pct_total)
+            pct_matrix.append(row_pcts)
 
     sig_matrix = _compute_sig_pct(pct_matrix, col_ns, col_letters, len(break_vals))
 
