@@ -960,49 +960,78 @@ def merge_crosstabs_banner(crosstabs):
     return banner
 
 
+def _make_global_letters(groups):
+    """Create continuous letter sequence across all banner groups for sig_total.
+    Returns: list of letters (one per column across all groups),
+             and list of (letter, label) tuples for legend.
+    """
+    letters = []
+    legend = []
+    idx = 0
+    for grp in groups:
+        for ci, lbl in enumerate(grp['col_labels']):
+            letter = SIG_LETTERS[idx] if idx < len(SIG_LETTERS) else f'A{idx}'
+            letters.append(letter)
+            legend.append((letter, lbl))
+            idx += 1
+    return letters, legend
+
+
 def compute_sig_total_banner(banner):
     """
     Compute significance of Total column vs each banner category column.
     Same z-test as 5_1_Sig_total.SBS.
-    Returns list of strings (one per row): letters of columns significantly
-    different from Total.
+    Uses continuous letters across ALL groups so Total column letters are unambiguous.
+    Returns dict with 'letters' (list of strings per row),
+    'directions' (list of dicts: global_letter -> '↑'/'↓'),
+    'global_letters'/'legend' for header/legend rendering.
     """
     groups = banner['groups']
     is_numeric = banner['type'] == 'numeric'
     total_n = banner['total_n']
     n_rows = len(banner['row_labels'])
-    sig_total = []
 
+    global_letters, legend = _make_global_letters(groups)
+
+    sig_total = []
+    directions = []  # per row: {global_letter: '↑' or '↓'}
+    flat_idx = 0  # running index across all groups/columns
     for ri in range(n_rows):
         letters = ''
+        row_dirs = {}
+        flat_idx = 0
         if is_numeric:
-            total_mean = banner['total_means'][ri]
+            total_val = banner['total_means'][ri]
             total_sd = banner.get('total_sds', [0] * n_rows)[ri]
         else:
-            total_pct = banner['total_pcts'][ri]
+            total_val = banner['total_pcts'][ri]
 
         for grp in groups:
             n_cols = len(grp['col_labels'])
             for ci in range(n_cols):
                 col_n = grp['col_ns'][ci]
-                col_letter = grp['col_letters'][ci]
+                gl = global_letters[flat_idx]
 
                 if is_numeric:
-                    col_mean = grp['mean_matrix'][ri][ci]
+                    col_val = grp['mean_matrix'][ri][ci]
                     col_sd = grp.get('sd_matrix', [[0]*n_cols]*n_rows)[ri][ci]
                     col_n_i = grp.get('n_matrix', [[0]*n_cols]*n_rows)[ri][ci]
-                    z = _mean_sig(total_mean, col_mean, total_sd, col_sd,
+                    z = _mean_sig(total_val, col_val, total_sd, col_sd,
                                   total_n, col_n_i if col_n_i else col_n)
                 else:
-                    col_pct = grp['pct_matrix'][ri][ci]
-                    z = _col_pct_sig(total_pct, col_pct, total_n, col_n)
+                    col_val = grp['pct_matrix'][ri][ci]
+                    z = _col_pct_sig(total_val, col_val, total_n, col_n)
 
                 if z >= SIG_LEVEL:
-                    letters += col_letter
+                    letters += gl
+                    row_dirs[gl] = '↑' if col_val > total_val else '↓'
+                flat_idx += 1
 
         sig_total.append(letters)
+        directions.append(row_dirs)
 
-    return sig_total
+    return {'letters': sig_total, 'directions': directions,
+            'global_letters': global_letters, 'legend': legend}
 
 
 def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
@@ -1068,35 +1097,47 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
     cell.alignment = Alignment(horizontal='center')
     row_num += 1
 
+    # ── Pre-compute sig_total if needed ──
+    sig_total_result = None
+    sig_total_letters = None
+    if show_sig_total:
+        sig_total_result = compute_sig_total_banner(banner)
+        sig_total_letters = sig_total_result['letters']
+
     # ── Letter row (A, B, C... restart per group) — only if show_sig ──
+    # For sig_total sheet, use continuous global letters instead of per-group
     if show_sig:
+        # Determine which letters to display per column
+        if show_sig_total and sig_total_result:
+            _gl = sig_total_result['global_letters']
+        else:
+            _gl = None
+
         ws.cell(row=row_num, column=1, value='').border = thin_border
         col_offset = 2
+        flat_idx = 0
         for gi, grp in enumerate(groups):
-            for ci, letter in enumerate(grp['col_letters']):
+            for ci, _per_grp_letter in enumerate(grp['col_letters']):
                 n = grp['col_ns'][ci]
                 base_mark = ''
                 if n < 30:
                     base_mark = '**'
                 elif n < 50:
                     base_mark = '*'
+                display_letter = _gl[flat_idx] if _gl else _per_grp_letter
                 cell = ws.cell(row=row_num, column=col_offset + ci,
-                               value=f"{letter}{base_mark}")
+                               value=f"{display_letter}{base_mark}")
                 cell.font = letter_font
                 cell.border = thin_border
                 cell.alignment = Alignment(horizontal='center')
                 if ci == 0 and gi > 0:
                     cell.border = Border(left=thick_side, right=thin_side,
                                          top=thin_side, bottom=thin_side)
+                flat_idx += 1
             col_offset += len(grp['col_labels'])
         # Total — empty
         ws.cell(row=row_num, column=col_offset, value='').border = thin_border
         row_num += 1
-
-    # ── Pre-compute sig_total if needed ──
-    sig_total_letters = None
-    if show_sig_total:
-        sig_total_letters = compute_sig_total_banner(banner)
 
     # ── Data rows ──
     for ri, label in enumerate(row_labels):
@@ -1108,6 +1149,7 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
             cell.fill = even_fill
 
         col_offset = 2
+        flat_idx = 0
         for gi, grp in enumerate(groups):
             n_gcols = len(grp['col_labels'])
             for ci in range(n_gcols):
@@ -1118,13 +1160,26 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                                  top=thin_side, bottom=thin_side)
                 cell.border = brd
 
+                # Check if this cell is sig different from Total
+                _st_hit = False
+                _st_arrow = ''
+                if show_sig_total and sig_total_result:
+                    gl = sig_total_result['global_letters'][flat_idx]
+                    if gl in (sig_total_letters[ri] if sig_total_letters else ''):
+                        _st_hit = True
+                        _st_arrow = sig_total_result['directions'][ri].get(gl, '')
+
                 if is_numeric:
                     val = grp['mean_matrix'][ri][ci]
-                    sig = grp['sig_matrix'][ri][ci] if (show_sig and ri < len(grp['sig_matrix'])) else ''
+                    sig = grp['sig_matrix'][ri][ci] if (show_sig and not show_sig_total and ri < len(grp['sig_matrix'])) else ''
                     if val == 0 and grp.get('n_matrix', [[]])[ri][ci] == 0:
                         cell.value = '.'
                     elif sig:
                         cell.value = f"{val:.2f}\n{sig}"
+                        cell.fill = sig_fill
+                        cell.alignment = Alignment(horizontal='right', wrap_text=True)
+                    elif _st_hit:
+                        cell.value = f"{val:.2f}\n{_st_arrow}"
                         cell.fill = sig_fill
                         cell.alignment = Alignment(horizontal='right', wrap_text=True)
                     else:
@@ -1133,11 +1188,21 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                         cell.alignment = Alignment(horizontal='right')
                 else:
                     pct = grp['pct_matrix'][ri][ci]
-                    sig = grp['sig_matrix'][ri][ci] if (show_sig and ri < len(grp['sig_matrix'])) else ''
-                    if pct == 0:
-                        cell.value = ''
+                    sig = grp['sig_matrix'][ri][ci] if (show_sig and not show_sig_total and ri < len(grp['sig_matrix'])) else ''
+                    if pct == 0 and not sig:
+                        cell.value = 0.0
+                        cell.number_format = '0.0'
+                        cell.alignment = Alignment(horizontal='right')
+                        if _st_hit:
+                            cell.value = f"0.0\n{_st_arrow}"
+                            cell.fill = sig_fill
+                            cell.alignment = Alignment(horizontal='right', wrap_text=True)
                     elif sig:
                         cell.value = f"{pct:.1f}\n{sig}"
+                        cell.fill = sig_fill
+                        cell.alignment = Alignment(horizontal='right', wrap_text=True)
+                    elif _st_hit:
+                        cell.value = f"{pct:.1f}\n{_st_arrow}"
                         cell.fill = sig_fill
                         cell.alignment = Alignment(horizontal='right', wrap_text=True)
                     else:
@@ -1146,7 +1211,8 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                         cell.alignment = Alignment(horizontal='right')
 
                 cell.font = data_font
-                if is_even and not (show_sig and
+                flat_idx += 1
+                if is_even and not _st_hit and not (show_sig and
                         (grp['sig_matrix'][ri][ci] if ri < len(grp['sig_matrix']) else '')):
                     cell.fill = even_fill
 
@@ -1169,8 +1235,10 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                 cell.alignment = Alignment(horizontal='right')
         else:
             pct_t = banner['total_pcts'][ri]
-            if pct_t == 0:
-                cell.value = ''
+            if pct_t == 0 and not st_letters:
+                cell.value = 0.0
+                cell.number_format = '0.0'
+                cell.alignment = Alignment(horizontal='right')
             elif st_letters:
                 cell.value = f"{pct_t:.1f}\n{st_letters}"
                 cell.fill = sig_fill
