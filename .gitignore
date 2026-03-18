@@ -1,0 +1,13 @@
+# Stare SPSS skripte i primjeri
+stare skripte/
+primjeri/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
