@@ -11,6 +11,7 @@ Potrebni paketi:
     pip install streamlit pyreadstat pandas openpyxl
 """
 
+import hashlib
 import io
 import json
 import os
@@ -23,6 +24,7 @@ import pandas as pd
 import pyreadstat
 import streamlit as st
 from openpyxl import load_workbook
+
 
 # Importaj engine funkcije iz spss_tables.py
 from spss_tables import (
@@ -79,6 +81,411 @@ def parse_input_bytes(raw_bytes):
         )
 
     return sections[0], sections[1], sections[2]
+
+
+def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None):
+    """
+    Validate input script against the data file.
+    Returns list of warning dicts: {'level': 'error'|'warning'|'info', 'msg': str}
+    """
+    warnings_list = []
+    col_set = {c.lower() for c in df_columns}
+
+    # Pre-build data base→vars map for per-line completeness checks
+    _q_var_pat = re.compile(r'^(q\d+|r\d+)_(\d+)$', re.I)
+    _data_base_vars = {}
+    for c in df_columns:
+        if df is not None and c in df.columns and pd.api.types.is_object_dtype(df[c]):
+            continue
+        m = _q_var_pat.match(c)
+        if m:
+            _data_base_vars.setdefault(m.group(1).lower(), set()).add(c.lower())
+
+    def _snippet(row_idx):
+        """Build context snippet for a given row index."""
+        parts = []
+        if row_idx < len(titles):
+            parts.append(f"Naslov:    {titles[row_idx].strip()[:200]}")
+        if row_idx < len(variables):
+            parts.append(f"Varijable: {variables[row_idx].strip()[:200]}")
+        return '\n'.join(parts) if parts else None
+
+    # 1. Check section lengths match
+    if len(titles) != len(variables):
+        diff = abs(len(titles) - len(variables))
+        longer = "naslova" if len(titles) > len(variables) else "varijabli"
+        shift_hint = ""
+        shift_idx = None
+        for idx in range(len(titles)):
+            t = titles[idx].strip()
+            if t.startswith('$') or ('+' in t and re.match(r'^\w+\s', t)):
+                shift_hint = f" Red {idx+1} u sekciji naslova izgleda kao definicija varijabli."
+                shift_idx = idx
+                break
+        if not shift_hint:
+            for idx in range(len(variables)):
+                v = variables[idx].strip()
+                if re.match(r'^[skdnmf]\s', v):
+                    shift_hint = f" Red {idx+1} u sekciji varijabli izgleda kao naslov tablice."
+                    shift_idx = idx
+                    break
+        # Build a multi-line snippet showing the mismatch area
+        shift_snippet = None
+        if shift_idx is not None:
+            lines = []
+            for off in range(max(0, shift_idx - 1), min(max(len(titles), len(variables)), shift_idx + 3)):
+                t_txt = titles[off].strip()[:80] if off < len(titles) else '(nema)'
+                v_txt = variables[off].strip()[:80] if off < len(variables) else '(nema)'
+                marker = '  ◄◄◄' if off == shift_idx else ''
+                lines.append(f"Red {off+1}:{marker}\n  N: {t_txt}\n  V: {v_txt}")
+            shift_snippet = '\n'.join(lines)
+        warnings_list.append({
+            'level': 'error',
+            'msg': f"Broj naslova ({len(titles)}) ne odgovara broju varijabli ({len(variables)}) "
+                   f"— {diff} {'više' if len(titles) > len(variables) else 'manje'} {longer}. "
+                   f"Moguće pomaknut red čitanja u input skripti.{shift_hint}",
+            'row': (shift_idx + 1) if shift_idx is not None else None,
+            'snippet': shift_snippet,
+        })
+        # When rows are shifted, other checks are unreliable — return early
+        return warnings_list
+
+    count = min(len(titles), len(variables))
+
+    # 2. Check break vars exist
+    for bv in break_vars:
+        if bv.strip().lower() not in col_set and bv.strip().lower() != 'id':
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"Break varijabla '{bv.strip()}' iz input skripte ne postoji u datafileu.",
+                'row': None, 'snippet': None,
+            })
+
+    # 3. Per-table checks
+    missing_vars = []
+    possible_cross_input = False
+
+    for i in range(count):
+        title_line = titles[i].strip()
+        var_line = variables[i].strip()
+
+        # Check if title line looks like a variable (no type prefix) — possible cross input
+        if not re.match(r'^[skdnmf]\s', title_line):
+            # Could be a cross-tab input format or corrupted
+            if any(title_line.lower().startswith(v.lower()) for v in df_columns[:50]):
+                possible_cross_input = True
+
+        # Check if var line looks like a title (has spaces and no var-like pattern)
+        if re.match(r'^[skdnmf]\s', var_line):
+            warnings_list.append({
+                'level': 'error',
+                'msg': f"Red {i+1}: varijabla '{var_line[:50]}' izgleda kao naslov tablice. "
+                       f"Moguće da je pomaknut red u input skripti.",
+                'row': i + 1, 'snippet': _snippet(i),
+            })
+            continue
+
+        # Extract var names and check existence
+        vars_in_line = []
+        if var_line.startswith('$'):
+            # MR: $e1 '' var1 var2 var3
+            parts = var_line.split()
+            vars_in_line = [p for p in parts if not p.startswith('$') and p != "''"]
+        elif '+' in var_line:
+            vars_in_line = [p for p in var_line.split() if '+' not in p]
+        else:
+            vars_in_line = var_line.split() if var_line else []
+
+        for v in vars_in_line:
+            if v.lower() not in col_set:
+                missing_vars.append((i + 1, v))
+
+        # 3e. Type vs variable-line format mismatch (checked early to gate later checks)
+        table_type = title_line[0].lower() if title_line else ''
+        is_mr_line = var_line.startswith('$')
+        is_numeric_line = '+' in var_line
+        is_single_var = not is_mr_line and not is_numeric_line and len(var_line.split()) == 1
+        is_multi_var = not is_mr_line and not is_numeric_line and len(var_line.split()) > 1
+        has_type_mismatch = False
+
+        if table_type in ('k', 'd') and not is_mr_line:
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"Red {i+1}: tip '{table_type}' očekuje MR varijable ($e1 ...)",
+                'row': i + 1, 'snippet': _snippet(i),
+            })
+            has_type_mismatch = True
+        elif table_type in ('n', 'm') and not is_numeric_line and not is_multi_var:
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"Red {i+1}: tip '{table_type}' očekuje numeričke varijable (var1 var2 ... var1+var2+...)",
+                'row': i + 1, 'snippet': _snippet(i),
+            })
+            has_type_mismatch = True
+        elif table_type == 's' and (is_mr_line or is_numeric_line or is_multi_var):
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"Red {i+1}: tip 's' očekuje jednu varijablu",
+                'row': i + 1, 'snippet': _snippet(i),
+            })
+            has_type_mismatch = True
+
+        # n/m with "var var" pattern (single-var numeric table) — valid syntax, skip dup/group
+        is_nm_single_var = (
+            table_type in ('n', 'm') and not is_numeric_line
+            and len(vars_in_line) == 2
+            and vars_in_line[0].lower() == vars_in_line[1].lower()
+        )
+
+        # 3b. Duplicate variables in a line (skip when type mismatch or n/m single-var)
+        if not has_type_mismatch and not is_nm_single_var:
+            seen_vars = []
+            for v in vars_in_line:
+                vl = v.lower()
+                if vl in seen_vars:
+                    warnings_list.append({
+                        'level': 'warning',
+                        'msg': f"Red {i+1}: varijabla '{v}' se ponavlja u definiciji",
+                        'row': i + 1, 'snippet': _snippet(i),
+                    })
+                else:
+                    seen_vars.append(vl)
+
+        # 3c. Title base vs variable base mismatch
+        title_base_match = re.match(r'^[skdnmf]\s+([a-zA-Z]+\d+)', title_line)
+        if title_base_match and vars_in_line:
+            title_base = title_base_match.group(1).lower()
+            # Extract bases from variable names (q1_1 → q1, r2_3 → r2)
+            var_bases = set()
+            base_pat = re.compile(r'^([a-zA-Z]+\d+)[r]?_\d+', re.I)
+            for v in vars_in_line:
+                bm = base_pat.match(v)
+                if bm:
+                    var_bases.add(bm.group(1).lower())
+            # Also for single vars (like 'r1' without underscore)
+            if not var_bases:
+                for v in vars_in_line:
+                    bm = re.match(r'^([a-zA-Z]+\d+)$', v)
+                    if bm:
+                        var_bases.add(bm.group(1).lower())
+            if var_bases and title_base not in var_bases:
+                warnings_list.append({
+                    'level': 'warning',
+                    'msg': f"Red {i+1}: naslov referira '{title_base}' ali varijable su iz grupe "
+                           f"{', '.join(sorted(var_bases))}",
+                    'row': i + 1, 'snippet': _snippet(i),
+                })
+
+        # 3d. Sum expression consistency check for numeric lines
+        if '+' in var_line and not var_line.startswith('$'):
+            sum_exprs = [p for p in var_line.split() if '+' in p]
+            sum_vars_set = set()
+            for expr in sum_exprs:
+                sum_vars_set.update(v.lower() for v in expr.split('+'))
+            listed_vars = [p.lower() for p in var_line.split() if '+' not in p]
+            listed_set = set(listed_vars)
+            not_in_sum = [v for v in listed_vars if v not in sum_vars_set]
+            in_sum_not_listed = sorted(v for v in sum_vars_set if v not in listed_set)
+            if not_in_sum:
+                warnings_list.append({
+                    'level': 'warning',
+                    'msg': f"Red {i+1}: varijable {', '.join(not_in_sum)} su navedene ali nisu u sumacijskom izrazu",
+                    'row': i + 1, 'snippet': _snippet(i),
+                })
+            if in_sum_not_listed:
+                warnings_list.append({
+                    'level': 'warning',
+                    'msg': f"Red {i+1}: varijable {', '.join(in_sum_not_listed)} su u sumacijskom izrazu ali nisu navedene pojedinačno",
+                    'row': i + 1, 'snippet': _snippet(i),
+                })
+
+        # 3f. Per-line incomplete group check (skip when type mismatch)
+        if not has_type_mismatch and len(vars_in_line) > 1 and _data_base_vars:
+            line_bases = {}
+            for v in vars_in_line:
+                bm = _q_var_pat.match(v)
+                if bm:
+                    line_bases.setdefault(bm.group(1).lower(), set()).add(v.lower())
+            for base, line_vars in line_bases.items():
+                if base in _data_base_vars:
+                    missing_in_line = sorted(_data_base_vars[base] - line_vars)
+                    if missing_in_line:
+                        if len(missing_in_line) <= 4:
+                            detail = ', '.join(missing_in_line)
+                        else:
+                            detail = ', '.join(missing_in_line[:3]) + f' ... (+{len(missing_in_line)-3})'
+                        warnings_list.append({
+                            'level': 'warning',
+                            'msg': f"Red {i+1}: grupa '{base}' — u datafileu postoje i: {detail}",
+                            'row': i + 1, 'snippet': _snippet(i),
+                        })
+
+    if possible_cross_input:
+        warnings_list.append({
+            'level': 'warning',
+            'msg': "Neki naslovi izgledaju kao imena varijabli. "
+                   "Moguće da je učitan križanje input umjesto total input skripte.",
+            'row': None, 'snippet': None,
+        })
+
+    # Summarize missing vars
+    if missing_vars:
+        if len(missing_vars) <= 5:
+            details = '; '.join(f"red {r}: {v}" for r, v in missing_vars)
+        else:
+            details = '; '.join(f"red {r}: {v}" for r, v in missing_vars[:5])
+            details += f" ... i još {len(missing_vars) - 5}"
+        # Build snippets for first few missing
+        miss_snippets = []
+        for r, v in missing_vars[:5]:
+            s = _snippet(r - 1)
+            if s:
+                miss_snippets.append(f"Red {r}:\n{s}")
+        warnings_list.append({
+            'level': 'warning',
+            'msg': f"{len(missing_vars)} varijabli iz input skripte ne postoji u datafileu: {details}",
+            'row': missing_vars[0][0] if missing_vars else None,
+            'snippet': '\n\n'.join(miss_snippets) if miss_snippets else None,
+        })
+
+    # 4. Check if data file has vars that look like they match question patterns in input
+    input_var_set = set()
+    for var_line in variables:
+        var_line = var_line.strip()
+        if var_line.startswith('$'):
+            parts = var_line.split()
+            input_var_set.update(p.lower() for p in parts if not p.startswith('$') and p != "''")
+        elif '+' in var_line:
+            input_var_set.update(p.lower() for p in var_line.split() if '+' not in p)
+        else:
+            input_var_set.update(p.lower() for p in var_line.split() if p)
+
+    # Find question-like vars in datafile not covered by input
+    q_pattern = re.compile(r'^(q\d+|r\d+)_\d+$', re.I)
+    data_q_bases = set()
+    input_q_bases = set()
+    for c in df_columns:
+        # Skip string/text variables — not relevant for table generation
+        if df is not None and c in df.columns and pd.api.types.is_object_dtype(df[c]):
+            continue
+        m = q_pattern.match(c)
+        if m:
+            data_q_bases.add(m.group(1).lower())
+    for v in input_var_set:
+        m = q_pattern.match(v)
+        if m:
+            input_q_bases.add(m.group(1).lower())
+
+    uncovered = data_q_bases - input_q_bases
+    if uncovered:
+        uncovered_sorted = sorted(uncovered)
+        if len(uncovered_sorted) <= 8:
+            details = ', '.join(uncovered_sorted)
+        else:
+            details = ', '.join(uncovered_sorted[:8]) + f' ... (+{len(uncovered_sorted)-8})'
+        warnings_list.append({
+            'level': 'info',
+            'msg': f"Detektirane varijable u datafileu koje nisu u input skripti: {details}",
+            'row': None, 'snippet': None,
+        })
+
+    return warnings_list
+
+
+def validate_datafile(df, meta, input_vars=None):
+    """
+    Validate datafile metadata (value labels, question labels).
+    input_vars: set of lowercase variable names used in the input script.
+    Returns list of warning dicts: {'level': 'error'|'warning'|'info', 'msg': str}
+    """
+    warnings_list = []
+    if meta is None or df is None:
+        return warnings_list
+
+    val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
+    labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
+    _input_vars = input_vars or set()
+
+    # 1. Values in data without a label (only for vars in input script that have value labels)
+    for var_name, vl_dict in val_labels_dict.items():
+        if var_name not in df.columns:
+            continue
+        if _input_vars and var_name.lower() not in _input_vars:
+            continue
+        data_vals = df[var_name].dropna().unique()
+        labeled_keys = set()
+        for k in vl_dict.keys():
+            labeled_keys.add(k)
+            try:
+                labeled_keys.add(float(k))
+            except (ValueError, TypeError):
+                pass
+            try:
+                labeled_keys.add(int(float(k)))
+            except (ValueError, TypeError):
+                pass
+        missing_vals = []
+        for v in data_vals:
+            if v not in labeled_keys:
+                missing_vals.append(v)
+        if missing_vals:
+            missing_vals.sort(key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
+            def _fmt_val(v):
+                if isinstance(v, float) and v == int(v):
+                    return str(int(v))
+                return str(v)
+            n_missing = len(missing_vals)
+            if n_missing == 1:
+                detail = f"vrijednost {_fmt_val(missing_vals[0])} nema labelu"
+            elif n_missing <= 4:
+                detail = f"vrijednosti {', '.join(_fmt_val(v) for v in missing_vals)} nemaju labele"
+            else:
+                detail = (f"{n_missing} vrijednosti nemaju labele "
+                          f"({', '.join(_fmt_val(v) for v in missing_vals[:3])} ...)")
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"{var_name}: {detail}",
+                'row': None, 'snippet': None,
+            })
+
+    # 3. Suspicious questionnaire phrasing — only flag sub-questions / open-ended prompts
+    _suspicious_patterns = [
+        # Croatian — "something else, what?" variants
+        r'ne\u0161to\s+drugo[,:]?\s*\u0161to',
+        r'neka\s+druga[,:]?\s*koja',
+        r'neki\s+drugi[,:]?\s*koji',
+        r'neko\s+drugo[,:]?\s*koje',
+        r'ne\u0161to\s+tre\u0107e[,:]?\s*\u0161to',
+        r'\u0161to\s*[?]',
+        r'koja\s*[?]',
+        r'koji\s*[?]',
+        r'koje\s*[?]',
+        # English — "other, specify" variants
+        r'something\s+else',
+        r'other[,:]?\s*(?:please\s+)?specify',
+        r'other[,:]?\s*what',
+        r'other[,:]?\s*which',
+        r'please\s+specify',
+    ]
+    _suspicious_re = re.compile('|'.join(_suspicious_patterns), re.I)
+
+    for var_name, vl_dict in val_labels_dict.items():
+        for val, label in vl_dict.items():
+            if _suspicious_re.search(str(label)):
+                warnings_list.append({
+                    'level': 'warning',
+                    'msg': f'{var_name}: value label "{label}"',
+                    'row': None, 'snippet': None,
+                })
+    for var_name, qlabel in labels_dict.items():
+        if _suspicious_re.search(str(qlabel)):
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f'{var_name}: question label "{str(qlabel)[:100]}"',
+                'row': None, 'snippet': None,
+            })
+
+    return warnings_list
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -366,6 +773,7 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
     for oi, out in enumerate(outputs):
         st.session_state[f'out_type_{oi}'] = out.get('type', 'total')
         st.session_state[f'out_name_{oi}'] = out.get('sheet_name', f'Output_{oi+1}')
+        st.session_state[f'out_name_dirty_{oi}'] = True
 
         # ── Filters ──
         fg = out.get('filter_groups', [])
@@ -436,18 +844,62 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
 
+def _auto_sheet_name(out_type, banner_indices, cat_var_names, use_weight):
+    """Generate automatic sheet name from output type and banner selection."""
+    if out_type == 'total':
+        base = 'total'
+    elif not banner_indices:
+        base = 'kriz'
+    else:
+        parts = []
+        for bi in banner_indices:
+            if bi < len(cat_var_names):
+                parts.append(cat_var_names[bi].lower())
+        base = ('kriz_' + '_'.join(parts)) if parts else 'kriz'
+    if use_weight:
+        base += '_pond'
+    return base[:31]
+
+
 def main():
+    _assets = os.path.join(os.path.dirname(__file__), 'assets')
+    _favicon_path = os.path.join(_assets, 'favicon.png')
     st.set_page_config(
-        page_title="SPSS Tables Generator",
-        page_icon="📊",
+        page_title="Hendalice",
+        page_icon=_favicon_path if os.path.exists(_favicon_path) else "📊",
         layout="wide",
     )
 
+    # ── Custom CSS ──
+    st.markdown("""
+    <style>
+    .header-row {
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        margin-bottom: 0.2rem;
+    }
+    .header-row h1 {
+        margin: 0;
+        font-size: 2rem;
+        font-weight: 700;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     # ── Header ──
-    st.title("📊 SPSS Tables Generator")
+    _logo_path = os.path.join(_assets, 'logo.svg')
+    if os.path.exists(_logo_path):
+        with open(_logo_path, 'r', encoding='utf-8') as _f:
+            _logo_svg = _f.read()
+    else:
+        _logo_svg = ''
     st.markdown(
-        "Generirajte profesionalne Excel tablice iz SPSS podataka — "
-        "bez potrebe za SPSS-om."
+        '<div class="header-row">'
+        f'{_logo_svg}'
+        '<h1>Hendalice</h1>'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
     st.divider()
@@ -455,9 +907,38 @@ def main():
     # ══════════════════════════════════════════════════
     #  KORAK 1: Upload fajlova
     # ══════════════════════════════════════════════════
-    st.header("1. Učitajte podatke")
+
+    def _reset_data():
+        """Clear loaded data files from session, keep outputs."""
+        for k in list(st.session_state.keys()):
+            if k.startswith(('df', 'meta', '_sav', 'titles', 'variables',
+                             'break_vars', '_input', 'var_groups',
+                             '_plan_applied', '_pending_plan')):
+                del st.session_state[k]
+        # Rotate uploader keys so widgets reset visually
+        st.session_state['_uploader_gen'] = st.session_state.get('_uploader_gen', 0) + 1
+
+    def _reset_all():
+        """Clear everything — data, outputs, all settings."""
+        gen = st.session_state.get('_uploader_gen', 0) + 1
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.session_state['_uploader_gen'] = gen
+
+    hdr1, _, btn_rd, btn_ra = st.columns([6, 1, 1.2, 1.2])
+    with hdr1:
+        st.header("1. Učitajte podatke")
+    with btn_rd:
+        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        st.button("🔄 Reset podataka", key="_btn_reset_data",
+                  on_click=_reset_data, help="Makni učitane fajlove, zadrži outpute")
+    with btn_ra:
+        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        st.button("🗑️ Reset svega", key="_btn_reset_all",
+                  on_click=_reset_all, help="Makni sve — podatke, outpute, postavke")
 
     col_sav, col_input = st.columns(2)
+    _ugen = st.session_state.get('_uploader_gen', 0)
 
     with col_sav:
         st.subheader("📁 SPSS podatkovni fajl (.sav)")
@@ -465,6 +946,7 @@ def main():
             "Odaberite .sav fajl",
             type=["sav"],
             help="SPSS podatkovni fajl s vašim podacima",
+            key=f"sav_upload_{_ugen}",
         )
 
     with col_input:
@@ -473,20 +955,24 @@ def main():
             "Odaberite input.txt",
             type=["txt"],
             help="Tekstualni fajl s definicijama tablica (3 sekcije odvojene praznim redom)",
+            key=f"input_upload_{_ugen}",
         )
 
     # ── Učitaj .sav ako je uploadano ──
     if sav_file is not None:
-        if 'df' not in st.session_state or st.session_state.get('_sav_name') != sav_file.name:
+        sav_bytes = sav_file.read()
+        sav_hash = hashlib.md5(sav_bytes).hexdigest()
+        if 'df' not in st.session_state or st.session_state.get('_sav_hash') != sav_hash:
             with st.spinner("Učitavam .sav podatke..."):
                 with tempfile.NamedTemporaryFile(suffix='.sav', delete=False) as tmp:
-                    tmp.write(sav_file.read())
+                    tmp.write(sav_bytes)
                     tmp_path = tmp.name
                 try:
                     df, meta = pyreadstat.read_sav(tmp_path, apply_value_formats=False)
                     st.session_state['df'] = df
                     st.session_state['meta'] = meta
                     st.session_state['_sav_name'] = sav_file.name
+                    st.session_state['_sav_hash'] = sav_hash
                 finally:
                     os.unlink(tmp_path)
 
@@ -500,13 +986,15 @@ def main():
 
     # ── Učitaj input.txt ako je uploadano ──
     if input_file is not None:
-        if 'titles' not in st.session_state or st.session_state.get('_input_name') != input_file.name:
-            raw = input_file.read()
+        raw = input_file.read()
+        input_hash = hashlib.md5(raw).hexdigest()
+        if 'titles' not in st.session_state or st.session_state.get('_input_hash') != input_hash:
             break_vars, titles, variables = parse_input_bytes(raw)
             st.session_state['break_vars'] = break_vars
             st.session_state['titles'] = titles
             st.session_state['variables'] = variables
             st.session_state['_input_name'] = input_file.name
+            st.session_state['_input_hash'] = input_hash
 
         titles = st.session_state['titles']
         variables = st.session_state['variables']
@@ -516,31 +1004,75 @@ def main():
         variables = None
 
     # ── Plan obrade (opcionalno) ──
-    with st.expander("📋 Plan obrade — učitaj prethodno spremljenu konfiguraciju", expanded=False):
-        plan_file = st.file_uploader(
-            "Učitajte _po.json fajl",
-            type=["json"],
-            help="Prethodno spremljeni plan obrade sa svim postavkama",
-        )
-        if plan_file is not None and df is not None and titles is not None:
-            if st.session_state.get('_plan_applied_name') != plan_file.name:
-                try:
-                    plan_data = json.loads(plan_file.read().decode('utf-8'))
-                    st.session_state['_pending_plan'] = plan_data
-                    st.session_state['_plan_applied_name'] = plan_file.name
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    st.error("❌ Neispravan JSON fajl.")
+    st.subheader("📋 Plan obrade")
+    plan_file = st.file_uploader(
+        "Učitajte prethodno spremljenu konfiguraciju (_po.json)",
+        type=["json"],
+        help="Prethodno spremljeni plan obrade sa svim postavkama",
+    )
+    if plan_file is not None and df is not None and titles is not None:
+        if st.session_state.get('_plan_applied_name') != plan_file.name:
+            try:
+                plan_data = json.loads(plan_file.read().decode('utf-8'))
+                st.session_state['_pending_plan'] = plan_data
+                st.session_state['_plan_applied_name'] = plan_file.name
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                st.error("❌ Neispravan JSON fajl.")
 
     if df is None or titles is None:
         st.info("👆 Učitajte oba fajla za nastavak.")
         return
 
+    # ── Validacija input skripte ──
+    break_vars = st.session_state.get('break_vars', [])
+    _validation_warnings = validate_input(titles, variables, list(df.columns), break_vars, df=df, meta=meta)
+    if _validation_warnings:
+        n_err = sum(1 for w in _validation_warnings if w['level'] == 'error')
+        n_warn = sum(1 for w in _validation_warnings if w['level'] == 'warning')
+        n_info = sum(1 for w in _validation_warnings if w['level'] == 'info')
+        parts = []
+        if n_err:
+            parts.append(f"{n_err} grešaka")
+        if n_warn:
+            parts.append(f"{n_warn} upozorenja")
+        if n_info:
+            parts.append(f"{n_info} info")
+        summary = ', '.join(parts)
+        with st.expander(f"⚠️ {summary} o input skripti", expanded=True):
+            for w in _validation_warnings:
+                snippet = w.get('snippet')
+                if w['level'] == 'error':
+                    st.error(w['msg'])
+                elif w['level'] == 'warning':
+                    st.warning(w['msg'])
+                else:
+                    st.info(w['msg'])
+                if snippet:
+                    st.code(snippet, language=None)
+
+    # ── Validacija datafile-a ──
+    _input_var_set = set()
+    for var_line in variables:
+        var_line_s = var_line.strip()
+        if var_line_s.startswith('$'):
+            _input_var_set.update(p.lower() for p in var_line_s.split() if not p.startswith('$') and p != "''")
+        elif '+' in var_line_s:
+            _input_var_set.update(p.lower() for p in var_line_s.split() if '+' not in p)
+        else:
+            _input_var_set.update(p.lower() for p in var_line_s.split() if p)
+    _df_warnings = validate_datafile(df, meta, input_vars=_input_var_set)
+    if _df_warnings:
+        n_warn_d = len(_df_warnings)
+        with st.expander(f"⚠️ {n_warn_d} upozorenja o datafileu", expanded=False):
+            for w in _df_warnings:
+                st.warning(w['msg'])
+
     st.divider()
 
     # ══════════════════════════════════════════════════
-    #  KORAK 2: Globalne postavke
+    #  KORAK 2: Postavke
     # ══════════════════════════════════════════════════
-    st.header("2. Globalne postavke")
+    st.header("2. Postavke")
 
     all_vars = list(df.columns)
     labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
@@ -561,29 +1093,38 @@ def main():
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
-        if 'start_num' in _g:
-            st.session_state['start_num'] = _g['start_num']
 
-    col_weight, col_start = st.columns(2)
+    st.subheader("⚖️ Ponder")
 
-    with col_weight:
-        st.subheader("⚖️ Ponder")
-        use_weight = st.checkbox("Koristi ponder", value=False, key="use_weight")
-        weight_col = None
-        if use_weight:
-            weight_idx = st.selectbox(
-                "Odaberite varijablu pondera:",
-                options=range(len(numeric_vars)),
-                format_func=lambda i: var_display(numeric_vars[i]),
-                key="weight_idx",
-            )
-            weight_col = numeric_vars[weight_idx]
-            st.caption(f"Suma: {df[weight_col].sum():.1f} | Prosjek: {df[weight_col].mean():.4f}")
+    # Auto-detect pond variable
+    _pond_candidates = [c for c in all_vars if c.lower() in ('pond', 'ponder', 'weight')]
+    if _pond_candidates and not st.session_state.get('use_weight', False):
+        pond_var = _pond_candidates[0]
+        st.info(f"💡 Detektirana ponder varijabla **{pond_var}** u datafileu, ali ponder nije uključen.")
 
-    with col_start:
-        st.subheader("🔢 Početni broj")
-        start_num = st.number_input("Početni broj tablice:", min_value=1, value=1, step=1,
-                                     key="start_num")
+    use_weight = st.checkbox("Koristi ponder", value=False, key="use_weight")
+    weight_col = None
+    if use_weight:
+        # Pre-select pond variable if detected
+        default_idx = 0
+        if _pond_candidates:
+            for pi, nv in enumerate(numeric_vars):
+                if nv == _pond_candidates[0]:
+                    default_idx = pi
+                    break
+            if 'weight_idx' not in st.session_state:
+                st.session_state['weight_idx'] = default_idx
+
+        weight_idx = st.selectbox(
+            "Odaberite varijablu pondera:",
+            options=range(len(numeric_vars)),
+            format_func=lambda i: var_display(numeric_vars[i]),
+            key="weight_idx",
+        )
+        weight_col = numeric_vars[weight_idx]
+        st.caption(f"Suma: {df[weight_col].sum():.1f} | Prosjek: {df[weight_col].mean():.4f}")
+
+    start_num = 1
 
     # ── Priprema za filtre i krizanja ──
     var_groups = build_variable_groups(titles, variables, df.columns)
@@ -650,18 +1191,64 @@ def main():
     # ══════════════════════════════════════════════════
     #  KORAK 3: Outputi
     # ══════════════════════════════════════════════════
-    st.header("3. Outputi")
-    st.caption("Svaki output = jedan Excel sheet. Može biti **Total** (frekvencijske tablice) "
-               "ili **Križanje** (banner tablice). Svaki output ima vlastiti filter.")
+
+    def _reset_outputs():
+        """Reset all outputs back to a single Total."""
+        n = st.session_state.get('n_outputs', 1)
+        for oi in range(n):
+            for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
+                            'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
+                k = key_tpl.format(oi)
+                if k in st.session_state:
+                    del st.session_state[k]
+            # Also clean filter group keys
+            for fi in range(st.session_state.get(f'n_fg_{oi}', 0) + 1):
+                for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
+                    k = fg_tpl.format(oi, fi)
+                    if k in st.session_state:
+                        del st.session_state[k]
+        st.session_state['n_outputs'] = 1
+        st.session_state['_out_order'] = [0]
+
+    hdr3, _, btn_rst = st.columns([6, 2, 1.2])
+    with hdr3:
+        st.header("3. Outputi")
+    with btn_rst:
+        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        st.button("🗑️ Reset outputa", key="_btn_reset_outputs",
+                  on_click=_reset_outputs, help="Obriši sve outpute i vrati na jedan Total")
+    st.caption("Svaki output postaje Excel sheet. Može biti **Total** ili **Križanje** (banner tablice).")
 
     if 'n_outputs' not in st.session_state:
         st.session_state['n_outputs'] = 1
 
     def _add_output():
-        st.session_state['n_outputs'] += 1
+        n = st.session_state['n_outputs']
+        st.session_state['n_outputs'] = n + 1
+        # Add new item to order
+        order = st.session_state.get('_out_order', list(range(n)))
+        order.append(n)
+        st.session_state['_out_order'] = order
+
     def _remove_output():
-        if st.session_state['n_outputs'] > 1:
-            st.session_state['n_outputs'] -= 1
+        n = st.session_state['n_outputs']
+        if n > 1:
+            # Remove the last logical index from order
+            order = st.session_state.get('_out_order', list(range(n)))
+            removed = n - 1
+            order = [x for x in order if x != removed]
+            # Clean session keys for removed output
+            for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
+                            'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
+                k = key_tpl.format(removed)
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state['_out_order'] = order
+            st.session_state['n_outputs'] = n - 1
 
     def _duplicate_output(src):
         """Copy all session_state keys from output *src* to a new output at the end."""
@@ -682,6 +1269,7 @@ def main():
         name_key = f'out_name_{dst}'
         if name_key in st.session_state:
             st.session_state[name_key] = st.session_state[name_key] + '_kopija'
+        st.session_state[f'out_name_dirty_{dst}'] = True
 
         # Filter group rows
         n_fg = st.session_state.get(f'n_fg_{src}', 0)
@@ -693,13 +1281,43 @@ def main():
 
     output_defs = []
 
-    for oi in range(st.session_state['n_outputs']):
+    n_out_total = st.session_state['n_outputs']
+
+    # ── Arrow-based reordering ──
+    if '_out_order' not in st.session_state:
+        st.session_state['_out_order'] = list(range(n_out_total))
+    order = st.session_state['_out_order']
+    # Ensure order is consistent with n_outputs
+    existing = set(range(n_out_total))
+    order = [x for x in order if x in existing]
+    for x in existing - set(order):
+        order.append(x)
+    st.session_state['_out_order'] = order
+
+    def _swap_outputs(pos_a, pos_b):
+        """Swap two outputs by their position in the order list."""
+        o = st.session_state['_out_order']
+        o[pos_a], o[pos_b] = o[pos_b], o[pos_a]
+        st.session_state['_out_order'] = o
+
+    for pos, oi in enumerate(order):
         with st.container(border=True):
             # ── Header: Output N ──
-            h_col, type_col, name_col, dup_col = st.columns([1, 2, 2, 0.6])
+            if n_out_total > 1:
+                up_col, dn_col, h_col, type_col, name_col, reset_col, dup_col = st.columns([0.18, 0.18, 0.7, 2, 2, 0.35, 0.35])
+                with up_col:
+                    st.button("▲", key=f"up_{oi}", disabled=(pos == 0),
+                              on_click=_swap_outputs, args=(pos, pos - 1),
+                              help="Pomakni gore")
+                with dn_col:
+                    st.button("▼", key=f"dn_{oi}", disabled=(pos == n_out_total - 1),
+                              on_click=_swap_outputs, args=(pos, pos + 1),
+                              help="Pomakni dolje")
+            else:
+                h_col, type_col, name_col, reset_col, dup_col = st.columns([0.8, 2, 2, 0.35, 0.35])
 
             with h_col:
-                st.markdown(f"### Output {oi + 1}")
+                st.markdown(f"### Output {pos + 1}")
 
             with dup_col:
                 st.button("📋", key=f"dup_{oi}",
@@ -715,10 +1333,39 @@ def main():
                     key=f"out_type_{oi}",
                 )
 
+            # ── Auto-name logic ──
+            prev_banner = st.session_state.get(f'out_banner_{oi}', [])
+            auto_name = _auto_sheet_name(out_type, prev_banner, cat_var_names, use_weight)
+            is_dirty = st.session_state.get(f'out_name_dirty_{oi}', False)
+            prev_auto = st.session_state.get(f'out_autoname_{oi}', '')
+
+            if not is_dirty and (f'out_name_{oi}' not in st.session_state or prev_auto != auto_name):
+                st.session_state[f'out_name_{oi}'] = auto_name
+            st.session_state[f'out_autoname_{oi}'] = auto_name
+
+            def _on_name_change(_oi=oi):
+                cur = st.session_state.get(f'out_name_{_oi}', '')
+                auto = st.session_state.get(f'out_autoname_{_oi}', '')
+                if cur != auto:
+                    st.session_state[f'out_name_dirty_{_oi}'] = True
+
+            def _reset_name(_oi=oi):
+                st.session_state[f'out_name_dirty_{_oi}'] = False
+                # Force the auto name to regenerate
+                if f'out_name_{_oi}' in st.session_state:
+                    del st.session_state[f'out_name_{_oi}']
+
             with name_col:
-                default_name = 'Total' if out_type == 'total' else f'Kriz_{oi + 1}'
-                sheet_name = st.text_input("Ime sheeta:", value=default_name,
-                                           key=f"out_name_{oi}")
+                sheet_name = st.text_input("Ime sheeta:",
+                                           key=f"out_name_{oi}",
+                                           on_change=_on_name_change)
+
+            with reset_col:
+                st.markdown("<div style='height:1.6rem'></div>", unsafe_allow_html=True)
+                if is_dirty:
+                    st.button("↻", key=f"reset_name_{oi}",
+                              on_click=_reset_name,
+                              help="Vrati automatski generirano ime")
 
             # ── Filter (per-output) ──
             with st.expander("🔍 Filter", expanded=False):
@@ -960,8 +1607,37 @@ def main():
                 '#': i + start_num,
                 'Tip': type_names.get(tt, tt),
                 'Naslov': tn[:80],
+                'Var': variables[i][:50] if i < len(variables) else '',
             })
-        st.dataframe(preview_data, width='stretch', hide_index=True)
+        st.dataframe(preview_data, use_container_width=True, hide_index=True)
+
+        # ── Prikaži par pravih tablica ──
+        st.markdown("---")
+        st.markdown("**Primjeri stvarnih tablica** (prvih 5)")
+        col_map = build_column_map(df)
+        _shown = 0
+        for i in range(min(len(titles), len(variables))):
+            if _shown >= 5:
+                break
+            title_line = titles[i]
+            var_line = variables[i]
+            tt = get_table_type(title_line)
+            tn = get_table_title(title_line)
+            try:
+                if tt == 's':
+                    tbl = make_simple_table(df, var_line.strip(), meta, col_map, weight_col)
+                elif tt in ('k', 'd'):
+                    tbl = make_mr_table(df, var_line, meta, col_map, tt, weight_col)
+                elif tt in ('n', 'm'):
+                    tbl = make_numeric_table(df, var_line, meta, col_map, tt == 'n', weight_col)
+                else:
+                    continue
+                tbl_df = pd.DataFrame(tbl['rows'], columns=tbl['header'])
+                st.caption(f"**T{i + start_num} [{tt}]** {tn[:70]}")
+                st.dataframe(tbl_df, use_container_width=True, hide_index=True, height=min(len(tbl_df) * 35 + 40, 300))
+                _shown += 1
+            except Exception:
+                continue
 
     # Sažetak outputa
     out_summary = []
@@ -1196,43 +1872,36 @@ def main():
     #  SIDEBAR: Info
     # ══════════════════════════════════════════════════
     with st.sidebar:
-        st.header("ℹ️ Upute")
+        st.markdown("### Hendalice")
         st.markdown("""
-        **Kako koristiti:**
+        **Koraci:**
 
-        1. **Učitajte .sav fajl** — vaši SPSS podaci
-        2. **Učitajte input.txt** — definicije tablica
-        3. **Globalne postavke** — ponder, početni broj
-        4. **Outputi** — definirajte Total i/ili Križanje outpute
-        5. **Kliknite Generiraj** i preuzmite Excel
+        1. Učitajte **.sav** i **input.txt**
+        2. Po potrebi uključite **ponder**
+        3. Kreirajte **outpute** (Total / Križanje)
+        4. **Generirajte** Excel
 
         ---
 
         **💾 Plan obrade:**
-        - Kliknite **Spremi plan obrade** za download _po.json
-        - Učitajte plan u koraku 1 da vratite sve postavke
+        Spremite konfiguraciju kao _po.json
+        i kasnije je učitajte za nastavak.
 
         ---
 
         **Tipovi tablica:**
-        - **s** — Frekvencija (n, %)
-        - **k** — Multiple Response
-        - **d** — Multi Dichotomy
-        - **n** — Numerička statistika
-        - **m** — Numerička kratka (Mean, N)
-        - **f** — Frequencies (sortirano)
-
-        ---
-
-        **Outputi:**
-        - **Total** — frekvencijske tablice
-        - **Križanje** — banner tablice (više break varijabli side-by-side)
-        - Svaki output ima vlastiti filter
-        - Značajnost → dva sheeta (bez + _sig)
+        | Tip | Opis |
+        |-----|------|
+        | s | Frekvencija (n, %) |
+        | k | Multiple Response |
+        | d | Multi Dichotomy |
+        | n | Numerička (full) |
+        | m | Numerička (mean) |
+        | f | Frequencies |
         """)
 
         st.divider()
-        st.caption("SPSS Tables Generator v2.0")
+        st.caption("Hendalice v2.1")
 
 
 if __name__ == '__main__':
