@@ -40,6 +40,7 @@ from spss_tables import (
     make_numeric_table,
     make_simple_table,
     merge_crosstabs_banner,
+    parse_numeric_vars,
     write_banner_to_sheet,
     write_tables_to_excel,
 )
@@ -105,9 +106,9 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
         """Build context snippet for a given row index."""
         parts = []
         if row_idx < len(titles):
-            parts.append(f"Naslov:    {titles[row_idx].strip()[:200]}")
+            parts.append(f"Naslov:    {titles[row_idx].strip()}")
         if row_idx < len(variables):
-            parts.append(f"Varijable: {variables[row_idx].strip()[:200]}")
+            parts.append(f"Varijable: {variables[row_idx].strip()}")
         return '\n'.join(parts) if parts else None
 
     # 1. Check section lengths match
@@ -134,8 +135,8 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
         if shift_idx is not None:
             lines = []
             for off in range(max(0, shift_idx - 1), min(max(len(titles), len(variables)), shift_idx + 3)):
-                t_txt = titles[off].strip()[:80] if off < len(titles) else '(nema)'
-                v_txt = variables[off].strip()[:80] if off < len(variables) else '(nema)'
+                t_txt = titles[off].strip() if off < len(titles) else '(nema)'
+                v_txt = variables[off].strip() if off < len(variables) else '(nema)'
                 marker = '  ◄◄◄' if off == shift_idx else ''
                 lines.append(f"Red {off+1}:{marker}\n  N: {t_txt}\n  V: {v_txt}")
             shift_snippet = '\n'.join(lines)
@@ -179,7 +180,7 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
         if re.match(r'^[skdnmf]\s', var_line):
             warnings_list.append({
                 'level': 'error',
-                'msg': f"Red {i+1}: varijabla '{var_line[:50]}' izgleda kao naslov tablice. "
+                'msg': f"Red {i+1}: varijabla '{var_line}' izgleda kao naslov tablice. "
                        f"Moguće da je pomaknut red u input skripti.",
                 'row': i + 1, 'snippet': _snippet(i),
             })
@@ -192,7 +193,8 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
             parts = var_line.split()
             vars_in_line = [p for p in parts if not p.startswith('$') and p != "''"]
         elif '+' in var_line:
-            vars_in_line = [p for p in var_line.split() if '+' not in p]
+            # Use same half-split logic as actual computation
+            vars_in_line = parse_numeric_vars(var_line)
         else:
             vars_in_line = var_line.split() if var_line else []
 
@@ -278,11 +280,11 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
 
         # 3d. Sum expression consistency check for numeric lines
         if '+' in var_line and not var_line.startswith('$'):
-            sum_exprs = [p for p in var_line.split() if '+' in p]
-            sum_vars_set = set()
-            for expr in sum_exprs:
-                sum_vars_set.update(v.lower() for v in expr.split('+'))
-            listed_vars = [p.lower() for p in var_line.split() if '+' not in p]
+            # Use same half-split logic as actual computation
+            _mid = len(var_line) // 2
+            _right = var_line[_mid:].strip()
+            sum_vars_set = {v.lower() for v in re.split(r'[+\s]+', _right) if v}
+            listed_vars = [v.lower() for v in parse_numeric_vars(var_line)]
             listed_set = set(listed_vars)
             not_in_sum = [v for v in listed_vars if v not in sum_vars_set]
             in_sum_not_listed = sorted(v for v in sum_vars_set if v not in listed_set)
@@ -310,10 +312,7 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
                 if base in _data_base_vars:
                     missing_in_line = sorted(_data_base_vars[base] - line_vars)
                     if missing_in_line:
-                        if len(missing_in_line) <= 4:
-                            detail = ', '.join(missing_in_line)
-                        else:
-                            detail = ', '.join(missing_in_line[:3]) + f' ... (+{len(missing_in_line)-3})'
+                        detail = ', '.join(missing_in_line)
                         warnings_list.append({
                             'level': 'warning',
                             'msg': f"Red {i+1}: grupa '{base}' — u datafileu postoje i: {detail}",
@@ -330,14 +329,10 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
 
     # Summarize missing vars
     if missing_vars:
-        if len(missing_vars) <= 5:
-            details = '; '.join(f"red {r}: {v}" for r, v in missing_vars)
-        else:
-            details = '; '.join(f"red {r}: {v}" for r, v in missing_vars[:5])
-            details += f" ... i još {len(missing_vars) - 5}"
-        # Build snippets for first few missing
+        details = '; '.join(f"red {r}: {v}" for r, v in missing_vars)
+        # Build snippets for missing vars
         miss_snippets = []
-        for r, v in missing_vars[:5]:
+        for r, v in missing_vars:
             s = _snippet(r - 1)
             if s:
                 miss_snippets.append(f"Red {r}:\n{s}")
@@ -379,10 +374,7 @@ def validate_input(titles, variables, df_columns, break_vars, df=None, meta=None
     uncovered = data_q_bases - input_q_bases
     if uncovered:
         uncovered_sorted = sorted(uncovered)
-        if len(uncovered_sorted) <= 8:
-            details = ', '.join(uncovered_sorted)
-        else:
-            details = ', '.join(uncovered_sorted[:8]) + f' ... (+{len(uncovered_sorted)-8})'
+        details = ', '.join(uncovered_sorted)
         warnings_list.append({
             'level': 'info',
             'msg': f"Detektirane varijable u datafileu koje nisu u input skripti: {details}",
@@ -407,14 +399,52 @@ def validate_datafile(df, meta, input_vars=None):
     _input_vars = input_vars or set()
 
     # 1. Values in data without a label (only for vars in input script that have value labels)
+    # Group input vars by base (e.g., q22_1, q22_2 → q22) to merge labels like table generation does
+    _base_pat = re.compile(r'^([a-zA-Z]+\d+)_\d+$', re.I)
+    _base_groups = {}  # base → [var_name, ...]
+    col_lower_map = {c.lower(): c for c in df.columns}
+    for v_lower in _input_vars:
+        actual = col_lower_map.get(v_lower)
+        if not actual:
+            continue
+        bm = _base_pat.match(actual)
+        if bm:
+            _base_groups.setdefault(bm.group(1).lower(), []).append(actual)
+
+    # Build merged label dicts per base group
+    _merged_labels_cache = {}  # base → merged dict
+    for base, var_list in _base_groups.items():
+        merged = {}
+        for vname in var_list:
+            vl = val_labels_dict.get(vname, {})
+            merged.update(vl)
+        _merged_labels_cache[base] = merged
+
+    _checked_bases = set()
     for var_name, vl_dict in val_labels_dict.items():
         if var_name not in df.columns:
             continue
         if _input_vars and var_name.lower() not in _input_vars:
             continue
-        data_vals = df[var_name].dropna().unique()
+        # Use merged labels for the base group (mirrors table generation)
+        bm = _base_pat.match(var_name)
+        if bm:
+            base = bm.group(1).lower()
+            if base in _checked_bases:
+                continue  # already reported for this group
+            _checked_bases.add(base)
+            check_labels = _merged_labels_cache.get(base, vl_dict)
+            # Check all values across all vars in the group
+            all_data_vals = set()
+            for gvar in _base_groups.get(base, [var_name]):
+                if gvar in df.columns:
+                    all_data_vals.update(df[gvar].dropna().unique())
+        else:
+            check_labels = vl_dict
+            all_data_vals = set(df[var_name].dropna().unique())
+
         labeled_keys = set()
-        for k in vl_dict.keys():
+        for k in check_labels.keys():
             labeled_keys.add(k)
             try:
                 labeled_keys.add(float(k))
@@ -425,7 +455,7 @@ def validate_datafile(df, meta, input_vars=None):
             except (ValueError, TypeError):
                 pass
         missing_vals = []
-        for v in data_vals:
+        for v in all_data_vals:
             if v not in labeled_keys:
                 missing_vals.append(v)
         if missing_vals:
@@ -435,16 +465,46 @@ def validate_datafile(df, meta, input_vars=None):
                     return str(int(v))
                 return str(v)
             n_missing = len(missing_vals)
+            label_src = f"grupa {base}" if bm else var_name
             if n_missing == 1:
                 detail = f"vrijednost {_fmt_val(missing_vals[0])} nema labelu"
             elif n_missing <= 4:
                 detail = f"vrijednosti {', '.join(_fmt_val(v) for v in missing_vals)} nemaju labele"
             else:
                 detail = (f"{n_missing} vrijednosti nemaju labele "
-                          f"({', '.join(_fmt_val(v) for v in missing_vals[:3])} ...)")
+                          f"({', '.join(_fmt_val(v) for v in missing_vals)} ...)")  
             warnings_list.append({
                 'level': 'warning',
-                'msg': f"{var_name}: {detail}",
+                'msg': f"{label_src}: {detail}",
+                'row': None, 'snippet': None,
+            })
+
+    # 2. Inconsistent value labels within a variable group
+    for base, var_list in _base_groups.items():
+        if len(var_list) < 2:
+            continue
+        # Collect label key sets per variable
+        all_keys = set()
+        per_var_keys = {}
+        for vname in var_list:
+            vl = val_labels_dict.get(vname, {})
+            keys = frozenset(vl.keys())
+            per_var_keys[vname] = keys
+            all_keys.update(keys)
+        # Find vars missing some labels
+        incomplete = []
+        for vname in sorted(var_list):
+            missing = all_keys - per_var_keys[vname]
+            if missing:
+                incomplete.append(vname)
+        if incomplete:
+            if len(incomplete) <= 4:
+                vstr = ', '.join(incomplete)
+            else:
+                vstr = ', '.join(incomplete[:3]) + f' ... (+{len(incomplete)-3})'
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"grupa {base}: nekonzistentne value labele — {vstr} nemaju sve labele koje imaju ostale varijable u grupi",
                 'row': None, 'snippet': None,
             })
 
@@ -606,6 +666,7 @@ def generate_tables(df, meta, titles, variables, weight_col, start_num):
                 continue
 
             result['title'] = title_str
+            result['_idx'] = i
             tables.append(result)
         except KeyError as e:
             errors.append(f"Tablica {table_num}: varijabla {e} ne postoji u podatcima")
@@ -745,6 +806,7 @@ def collect_plan(output_defs, use_weight, weight_col, start_num):
             'use_weight': bool(use_weight),
             'weight_col': weight_col,
             'start_num': int(start_num),
+            'add_toc': bool(st.session_state.get('add_toc', False)),
         },
         'outputs': [],
     }
@@ -858,7 +920,7 @@ def _auto_sheet_name(out_type, banner_indices, cat_var_names, use_weight):
         base = ('kriz_' + '_'.join(parts)) if parts else 'kriz'
     if use_weight:
         base += '_pond'
-    return base[:31]
+    return base
 
 
 def main():
@@ -868,7 +930,43 @@ def main():
         page_title="Hendalice",
         page_icon=_favicon_path if os.path.exists(_favicon_path) else "📊",
         layout="wide",
+        initial_sidebar_state="collapsed",
     )
+
+    # ══════════════════════════════════════════════════
+    #  SIDEBAR: Info
+    # ══════════════════════════════════════════════════
+    with st.sidebar:
+        st.markdown("### Hendalice")
+        st.markdown("""
+        **Koraci:**
+
+        1. Učitajte **.sav** i **input.txt**
+        2. Po potrebi uključite **ponder**
+        3. Kreirajte **outpute** (Total / Križanje)
+        4. **Generirajte** Excel
+
+        ---
+
+        **💾 Plan obrade:**
+        Spremite konfiguraciju kao _po.json
+        i kasnije je učitajte za nastavak.
+
+        ---
+
+        **Tipovi tablica:**
+        | Tip | Opis |
+        |-----|------|
+        | s | Frekvencija (n, %) |
+        | k | Multiple Response |
+        | d | Multi Dichotomy |
+        | n | Numerička (full) |
+        | m | Numerička (mean) |
+        | f | Frequencies |
+        """)
+
+        st.divider()
+        st.caption("Hendalice v2.1")
 
     # ── Custom CSS ──
     st.markdown("""
@@ -921,9 +1019,29 @@ def main():
     def _reset_all():
         """Clear everything — data, outputs, all settings."""
         gen = st.session_state.get('_uploader_gen', 0) + 1
+        n_prev = st.session_state.get('n_outputs', 1)
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.session_state['_uploader_gen'] = gen
+        # Explicitly set widget keys to defaults so Streamlit's internal
+        # widget cache is overridden on next render
+        st.session_state['use_weight'] = False
+        st.session_state['add_toc'] = False
+        st.session_state['table_design'] = 'hendal'
+        st.session_state['n_outputs'] = 1
+        st.session_state['_out_order'] = [0]
+        # Reset output widgets for all previously active outputs
+        for oi in range(max(n_prev, 1)):
+            st.session_state[f'out_type_{oi}'] = 'total'
+            st.session_state[f'out_filt_{oi}'] = False
+            st.session_state[f'out_sig_{oi}'] = False
+            st.session_state[f'out_sigtot_{oi}'] = False
+            st.session_state[f'out_banner_{oi}'] = []
+            st.session_state[f'out_name_dirty_{oi}'] = False
+            for k in (f'out_name_{oi}', f'out_autoname_{oi}',
+                      f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
+                      f'n_fg_{oi}'):
+                st.session_state.pop(k, None)
 
     hdr1, _, btn_rd, btn_ra = st.columns([6, 1, 1.2, 1.2])
     with hdr1:
@@ -1009,6 +1127,7 @@ def main():
         "Učitajte prethodno spremljenu konfiguraciju (_po.json)",
         type=["json"],
         help="Prethodno spremljeni plan obrade sa svim postavkama",
+        key=f"plan_upload_{_ugen}",
     )
     if plan_file is not None and df is not None and titles is not None:
         if st.session_state.get('_plan_applied_name') != plan_file.name:
@@ -1090,6 +1209,7 @@ def main():
     if _pp:
         _g = _pp.get('global', {})
         st.session_state['use_weight'] = _g.get('use_weight', False)
+        st.session_state['add_toc'] = _g.get('add_toc', False)
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
@@ -1125,6 +1245,18 @@ def main():
         st.caption(f"Suma: {df[weight_col].sum():.1f} | Prosjek: {df[weight_col].mean():.4f}")
 
     start_num = 1
+
+    st.subheader("📑 Table of Contents")
+    add_toc = st.checkbox("Dodaj TOC sheet (BETA)", value=False, key="add_toc",
+                          help="Dodaje početni sheet s popisom svih tablica i linkovima")
+
+    st.subheader("🎨 Dizajn tablica")
+    table_design = st.selectbox(
+        "Stil:",
+        options=['hendal'],
+        format_func=lambda x: {'hendal': '🟡 Hendal'}[x],
+        key="table_design",
+    )
 
     # ── Priprema za filtre i krizanja ──
     var_groups = build_variable_groups(titles, variables, df.columns)
@@ -1335,13 +1467,17 @@ def main():
 
             # ── Auto-name logic ──
             prev_banner = st.session_state.get(f'out_banner_{oi}', [])
-            auto_name = _auto_sheet_name(out_type, prev_banner, cat_var_names, use_weight)
+            auto_name_full = _auto_sheet_name(out_type, prev_banner, cat_var_names, use_weight)
+            auto_name = auto_name_full[:31]
             is_dirty = st.session_state.get(f'out_name_dirty_{oi}', False)
             prev_auto = st.session_state.get(f'out_autoname_{oi}', '')
 
             if not is_dirty and (f'out_name_{oi}' not in st.session_state or prev_auto != auto_name):
                 st.session_state[f'out_name_{oi}'] = auto_name
             st.session_state[f'out_autoname_{oi}'] = auto_name
+
+            if len(auto_name_full) > 31 and not is_dirty:
+                st.caption(f"ℹ️ Auto ime odrezano na 31 znak: **{auto_name}** (puno ime: {auto_name_full})")
 
             def _on_name_change(_oi=oi):
                 cur = st.session_state.get(f'out_name_{_oi}', '')
@@ -1359,6 +1495,8 @@ def main():
                 sheet_name = st.text_input("Ime sheeta:",
                                            key=f"out_name_{oi}",
                                            on_change=_on_name_change)
+                if len(sheet_name) > 31:
+                    st.warning(f"⚠️ Ime sheeta ima {len(sheet_name)} znakova — Excel limit je 31. Bit će odrezano na: **{sheet_name[:31]}**")
 
             with reset_col:
                 st.markdown("<div style='height:1.6rem'></div>", unsafe_allow_html=True)
@@ -1672,6 +1810,63 @@ def main():
         total_xt = 0
         all_errors = []
 
+        # ── Pre-build TOC question structure ──
+        toc_rows = []        # ordered list of question dicts
+        toc_positions = {}   # table_idx → list of {'sheet', 'row', 'cat', 'kriz_idx'}
+        toc_kriz_sheets = [] # list of {'plain', 'sig', 'sigT'} per kriz output
+        if add_toc:
+            import re as _re
+            _base_to_row = {}
+            _mean_pending = []
+
+            for _ti in range(len(titles)):
+                _ttype = get_table_type(titles[_ti])
+                _ttitle = get_table_title(titles[_ti])
+                _stripped = _ttitle.rstrip()
+                _is_t2b = _stripped.endswith('- T2B')
+                _is_mean = _ttype in ('n', 'm')
+
+                if _is_mean:
+                    _mv = _re.match(r'^(\S+)', _ttitle.strip())
+                    _mean_var = _mv.group(1).rstrip('.:') if _mv else ''
+                    _mean_pending.append((_ti, _mean_var))
+                elif _is_t2b:
+                    _base = _stripped[:-5].rstrip()  # remove "- T2B"
+                    if _base in _base_to_row:
+                        toc_rows[_base_to_row[_base]]['t2b_idx'] = _ti
+                    else:
+                        _base_to_row[_base] = len(toc_rows)
+                        toc_rows.append({'title': _base, 'regular_idx': None,
+                                         'mean_idx': None, 't2b_idx': _ti})
+                else:
+                    _base = _stripped
+                    if _base not in _base_to_row:
+                        _base_to_row[_base] = len(toc_rows)
+                        toc_rows.append({'title': _base, 'regular_idx': _ti,
+                                         'mean_idx': None, 't2b_idx': None})
+
+            # Link MEAN tables to sub-questions by prefix
+            for _mi, _mvar in _mean_pending:
+                _matched = False
+                if _mvar:
+                    for _row in toc_rows:
+                        _rm = _re.match(r'^(\S+)', _row['title'].strip())
+                        _rv = _rm.group(1).rstrip('.:') if _rm else ''
+                        if _rv and (
+                            _rv == _mvar or
+                            (_rv.startswith(_mvar) and len(_rv) > len(_mvar) and _rv[len(_mvar)] == '.')
+                        ):
+                            _row['mean_idx'] = _mi
+                            _matched = True
+                if not _matched:
+                    _mt = get_table_title(titles[_mi]).rstrip()
+                    if _mt.endswith('- MEAN'):
+                        _mt = _mt[:-6].rstrip()
+                    if _mt not in _base_to_row:
+                        _base_to_row[_mt] = len(toc_rows)
+                        toc_rows.append({'title': _mt, 'regular_idx': None,
+                                         'mean_idx': _mi, 't2b_idx': None})
+
         n_out = len(output_defs)
         for out_i, out_def in enumerate(output_defs):
             pct_base = int(10 + 80 * out_i / max(n_out, 1))
@@ -1725,6 +1920,19 @@ def main():
                     # Kopiraj merge cells
                     for mc in _srcws.merged_cells.ranges:
                         _destws.merge_cells(str(mc))
+
+                    # ── TOC positions for total tables ──
+                    if add_toc:
+                        _toc_r = 1
+                        for tbl in tables:
+                            _gi = tbl.get('_idx')
+                            if _gi is not None:
+                                toc_positions.setdefault(_gi, []).append({
+                                    'sheet': sname, 'row': _toc_r, 'cat': 'total'})
+                            n_data = len(tbl['rows'])
+                            has_caption = bool(tbl.get('caption', ''))
+                            _toc_r += 1 + 1 + n_data + (1 if has_caption else 0) + 1
+
                 _twb.close()
                 os.unlink(_tf_path)
 
@@ -1761,6 +1969,15 @@ def main():
                 current_row_sig = 1
                 current_row_st = 1
 
+                # Track kriz output for TOC
+                if add_toc:
+                    _ki = len(toc_kriz_sheets)
+                    toc_kriz_sheets.append({
+                        'plain': ws_name,
+                        'sig': sig_name if show_sig else None,
+                        'sigT': sig_total_name if show_sig_total else None,
+                    })
+
                 for ti in tbl_indices:
                     title_line = titles[ti]
                     var_line = variables[ti]
@@ -1774,7 +1991,7 @@ def main():
                         # Preskoči samo-križanje
                         if table_type == 's' and var_line.strip().lower() == break_var.lower():
                             continue
-                        if break_var.lower() in var_line.lower():
+                        if break_var.lower() in [v.strip().lower() for v in var_line.split()]:
                             continue
 
                         try:
@@ -1801,8 +2018,19 @@ def main():
 
                     # Merge into banner
                     banner = merge_crosstabs_banner(crosstabs)
-                    title_str = f"T{table_num} {table_title}"
+                    title_str = table_title
                     total_xt += 1
+
+                    # ── TOC positions for krizanje table ──
+                    if add_toc:
+                        toc_positions.setdefault(ti, []).append({
+                            'sheet': ws_name, 'row': current_row, 'cat': 'kriz', 'kriz_idx': _ki})
+                        if ws_sig is not None:
+                            toc_positions.setdefault(ti, []).append({
+                                'sheet': sig_name, 'row': current_row_sig, 'cat': 'kriz_sig', 'kriz_idx': _ki})
+                        if ws_sig_total is not None:
+                            toc_positions.setdefault(ti, []).append({
+                                'sheet': sig_total_name, 'row': current_row_st, 'cat': 'kriz_sigT', 'kriz_idx': _ki})
 
                     # Write to plain sheet (no sig)
                     current_row = write_banner_to_sheet(
@@ -1824,6 +2052,136 @@ def main():
                             start_row=current_row_st, show_sig=True,
                             show_sig_total=True)
                         current_row_st += 2
+
+        # ── TOC sheet (question-centric) ──
+        if add_toc and toc_rows:
+            import re as _re
+            from openpyxl.styles import Font as _Font, PatternFill as _Fill, Alignment as _Align, Border, Side
+            toc_ws = wb.create_sheet("TOC (BETA)", 0)
+
+            _hfont = _Font(name='Calibri', size=11, bold=True, color='1D1D1B')
+            _hfill = _Fill(start_color='FFD400', end_color='FFD400', fill_type='solid')
+            _lfont = _Font(name='Calibri', size=10, color='A693C6', underline='single')
+            _dfont = _Font(name='Calibri', size=10, color='1D1D1B')
+            _even_fill = _Fill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
+            _brd = Border(bottom=Side(style='thin', color='E0DDD8'))
+
+            def _var_name(title):
+                m = _re.match(r'^(\S+)', title.strip())
+                return m.group(1).rstrip('.:') if m else title[:20]
+
+            def _make_link(ws, row, col, text, sheet, cell_row, fill=None):
+                safe = sheet.replace("'", "''")
+                c = ws.cell(row=row, column=col, value=text)
+                c.hyperlink = f"#'{safe}'!A{cell_row}"
+                c.font = _lfont
+                c.border = _brd
+                if fill: c.fill = fill
+                c.alignment = _Align(horizontal='center')
+
+            # Build dynamic columns: fixed + per-kriz output
+            fixed_headers = ['#', 'Pitanje', 'Total', 'MEAN', 'T2B']
+            kriz_cols = []  # (header, kriz_idx, cat)
+            for ki, ks in enumerate(toc_kriz_sheets):
+                kriz_cols.append((ks['plain'], ki, 'kriz'))
+                if ks['sig']:
+                    kriz_cols.append((ks['sig'], ki, 'kriz_sig'))
+                if ks['sigT']:
+                    kriz_cols.append((ks['sigT'], ki, 'kriz_sigT'))
+            all_headers = fixed_headers + [kc[0] for kc in kriz_cols]
+
+            _hbrd = Border(bottom=Side(style='medium', color='1D1D1B'))
+
+            # Write header row
+            for ci, h in enumerate(all_headers, 1):
+                c = toc_ws.cell(row=1, column=ci, value=h)
+                c.font = _hfont
+                c.fill = _hfill
+                c.alignment = _Align(horizontal='center', vertical='center')
+                c.border = _hbrd
+
+            # Write data rows
+            for ri, qrow in enumerate(toc_rows, 2):
+                _row_fill = _even_fill if ri % 2 == 0 else None
+                # #
+                c = toc_ws.cell(row=ri, column=1, value=ri - 1)
+                c.font = _dfont; c.border = _brd
+                if _row_fill: c.fill = _row_fill
+                c.alignment = _Align(horizontal='center')
+
+                # Pitanje
+                c = toc_ws.cell(row=ri, column=2, value=qrow['title'])
+                c.font = _dfont; c.border = _brd
+                if _row_fill: c.fill = _row_fill
+
+                # Total (col 3)
+                _ridx = qrow.get('regular_idx')
+                if _ridx is not None:
+                    _tp = [p for p in toc_positions.get(_ridx, []) if p['cat'] == 'total']
+                    if _tp:
+                        _make_link(toc_ws, ri, 3, _var_name(qrow['title']),
+                                   _tp[0]['sheet'], _tp[0]['row'], _row_fill)
+                    else:
+                        c = toc_ws.cell(row=ri, column=3); c.border = _brd
+                        if _row_fill: c.fill = _row_fill
+                else:
+                    c = toc_ws.cell(row=ri, column=3); c.border = _brd
+                    if _row_fill: c.fill = _row_fill
+
+                # MEAN (col 4)
+                _midx = qrow.get('mean_idx')
+                if _midx is not None:
+                    _tp = [p for p in toc_positions.get(_midx, []) if p['cat'] == 'total']
+                    if _tp:
+                        _mt = get_table_title(titles[_midx])
+                        _make_link(toc_ws, ri, 4, _var_name(_mt),
+                                   _tp[0]['sheet'], _tp[0]['row'], _row_fill)
+                    else:
+                        c = toc_ws.cell(row=ri, column=4); c.border = _brd
+                        if _row_fill: c.fill = _row_fill
+                else:
+                    c = toc_ws.cell(row=ri, column=4); c.border = _brd
+                    if _row_fill: c.fill = _row_fill
+
+                # T2B (col 5)
+                _tidx = qrow.get('t2b_idx')
+                if _tidx is not None:
+                    _tp = [p for p in toc_positions.get(_tidx, []) if p['cat'] == 'total']
+                    if _tp:
+                        _make_link(toc_ws, ri, 5, _var_name(qrow['title']),
+                                   _tp[0]['sheet'], _tp[0]['row'], _row_fill)
+                    else:
+                        c = toc_ws.cell(row=ri, column=5); c.border = _brd
+                        if _row_fill: c.fill = _row_fill
+                else:
+                    c = toc_ws.cell(row=ri, column=5); c.border = _brd
+                    if _row_fill: c.fill = _row_fill
+
+                # Krizanje columns
+                for kci, (kname, kidx, kcat) in enumerate(kriz_cols):
+                    col_num = 6 + kci
+                    _found = False
+                    for _try_idx in [_ridx, _tidx, _midx]:
+                        if _try_idx is None:
+                            continue
+                        _tp = [p for p in toc_positions.get(_try_idx, [])
+                               if p['cat'] == kcat and p.get('kriz_idx') == kidx]
+                        if _tp:
+                            _make_link(toc_ws, ri, col_num, _var_name(qrow['title']),
+                                       _tp[0]['sheet'], _tp[0]['row'], _row_fill)
+                            _found = True
+                            break
+                    if not _found:
+                        c = toc_ws.cell(row=ri, column=col_num); c.border = _brd
+                        if _row_fill: c.fill = _row_fill
+
+            # Column widths
+            toc_ws.column_dimensions['A'].width = 5
+            toc_ws.column_dimensions['B'].width = 55
+            from openpyxl.utils import get_column_letter as _gcl
+            for ci in range(3, len(all_headers) + 1):
+                toc_ws.column_dimensions[_gcl(ci)].width = 14
+            toc_ws.freeze_panes = 'C2'
 
         # Spremi workbook
         if not wb.worksheets:
@@ -1867,41 +2225,6 @@ def main():
         )
 
         st.success("✅ Tablice uspješno generirane!")
-
-    # ══════════════════════════════════════════════════
-    #  SIDEBAR: Info
-    # ══════════════════════════════════════════════════
-    with st.sidebar:
-        st.markdown("### Hendalice")
-        st.markdown("""
-        **Koraci:**
-
-        1. Učitajte **.sav** i **input.txt**
-        2. Po potrebi uključite **ponder**
-        3. Kreirajte **outpute** (Total / Križanje)
-        4. **Generirajte** Excel
-
-        ---
-
-        **💾 Plan obrade:**
-        Spremite konfiguraciju kao _po.json
-        i kasnije je učitajte za nastavak.
-
-        ---
-
-        **Tipovi tablica:**
-        | Tip | Opis |
-        |-----|------|
-        | s | Frekvencija (n, %) |
-        | k | Multiple Response |
-        | d | Multi Dichotomy |
-        | n | Numerička (full) |
-        | m | Numerička (mean) |
-        | f | Frequencies |
-        """)
-
-        st.divider()
-        st.caption("Hendalice v2.1")
 
 
 if __name__ == '__main__':

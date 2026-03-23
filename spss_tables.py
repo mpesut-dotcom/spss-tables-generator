@@ -113,6 +113,17 @@ def get_value_labels(var_name, meta):
     return val_labels.get(var_name, {})
 
 
+def merge_value_labels(var_names, meta):
+    """Merge value labels from all variables — first var wins on conflicts."""
+    merged = {}
+    for vname in reversed(var_names):
+        vl = get_value_labels(vname, meta)
+        merged.update(vl)
+    # First variable's labels take priority (applied last)
+    merged.update(get_value_labels(var_names[0], meta))
+    return merged
+
+
 def label_for_value(val, val_labels):
     """Pronadi label za vrijednost, handling float/int key mismatch."""
     if val in val_labels:
@@ -250,8 +261,8 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
         all_vals = sorted(all_vals,
                           key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
 
-        # Value labels from first variable (they all share the same)
-        vlabels = get_value_labels(var_names[0], meta)
+        # Value labels merged from all variables (first var wins on conflicts)
+        vlabels = merge_value_labels(var_names, meta)
 
         for val in all_vals:
             label = label_for_value(val, vlabels)
@@ -399,29 +410,30 @@ def make_freq_table(df, var_name, meta, col_map, weight_col=None):
 #  EXCEL PISANJE
 # ═══════════════════════════════════════════════════════════════════
 
-def write_tables_to_excel(tables, output_path):
+def write_tables_to_excel(tables, output_path, design='hendal'):
     """Pise sve tablice u Excel fajl s formatiranjem."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Total Tables"
 
-    # Stilovi
-    title_font = Font(name='Arial', size=11, bold=True)
-    header_font = Font(name='Arial', size=10, bold=True, color='FFFFFF')
-    data_font = Font(name='Arial', size=10)
-    total_font = Font(name='Arial', size=10, bold=True)
-    caption_font = Font(name='Arial', size=9, italic=True, color='666666')
-    pct_font = Font(name='Arial', size=10, color='333333')
+    # ── Hendal design ──
+    _fn = 'Calibri'
+    title_font = Font(name=_fn, size=11, bold=True, color='1D1D1B')
+    header_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
+    data_font = Font(name=_fn, size=10, color='1D1D1B')
+    total_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
+    caption_font = Font(name=_fn, size=9, italic=True, color='888888')
 
-    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
-    total_fill = PatternFill(start_color='D6DCE4', end_color='D6DCE4', fill_type='solid')
-    even_fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
+    header_fill = PatternFill(start_color='FFD400', end_color='FFD400', fill_type='solid')
+    total_fill = PatternFill(start_color='F4F7E0', end_color='F4F7E0', fill_type='solid')
+    even_fill = PatternFill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
 
-    thin_side = Side(style='thin', color='B4B4B4')
-    thin_border = Border(
-        left=thin_side, right=thin_side,
-        top=thin_side, bottom=thin_side,
-    )
+    _line = Side(style='thin', color='E0DDD8')
+    no_border = Border()
+    row_border = Border(bottom=_line)
+    header_border = Border(bottom=Side(style='medium', color='1D1D1B'))
+    total_border = Border(top=Side(style='thin', color='CABB9F'),
+                          bottom=Side(style='medium', color='1D1D1B'))
 
     # Track max widths per column
     col_widths = {}
@@ -438,6 +450,7 @@ def write_tables_to_excel(tables, output_path):
         # ── Naslov tablice ──
         cell = ws.cell(row=row_num, column=1, value=title_str)
         cell.font = title_font
+        cell.alignment = Alignment(vertical='center')
         ws.merge_cells(
             start_row=row_num, start_column=1,
             end_row=row_num, end_column=num_cols,
@@ -449,7 +462,7 @@ def write_tables_to_excel(tables, output_path):
             cell = ws.cell(row=row_num, column=col_idx, value=h)
             cell.font = header_font
             cell.fill = header_fill
-            cell.border = thin_border
+            cell.border = header_border
             cell.alignment = Alignment(
                 horizontal='center' if col_idx > 1 else 'left',
                 vertical='center',
@@ -457,9 +470,13 @@ def write_tables_to_excel(tables, output_path):
             _track_width(col_widths, col_idx, h)
         row_num += 1
 
+        # ── Determine which columns are count (n/N) columns ──
+        _n_cols = {ci for ci, h in enumerate(header, 1)
+                   if str(h).strip().lower() in ('n',)}
+
         # ── Data redovi ──
         for i, data_row in enumerate(data_rows):
-            is_total = (i == len(data_rows) - 1)
+            is_total = (i == len(data_rows) - 1) and len(data_row) > 0 and str(data_row[0]).strip().lower().startswith('total')
             is_even = (i % 2 == 1) and not is_total
 
             for col_idx, val in enumerate(data_row, 1):
@@ -471,7 +488,7 @@ def write_tables_to_excel(tables, output_path):
                     cell.value = '.'
                 elif isinstance(val, float):
                     cell.value = val
-                    cell.number_format = '0.0'
+                    cell.number_format = '0' if col_idx in _n_cols else '0.0'
                 elif isinstance(val, (int, np.integer)):
                     cell.value = int(val)
                     cell.number_format = '#,##0'
@@ -479,7 +496,7 @@ def write_tables_to_excel(tables, output_path):
                     cell.value = str(val)
 
                 cell.font = total_font if is_total else data_font
-                cell.border = thin_border
+                cell.border = total_border if is_total else row_border
 
                 if is_total:
                     cell.fill = total_fill
@@ -686,7 +703,7 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
         all_vals.discard(0)
         all_vals = sorted(all_vals,
                           key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
-        vlabels = get_value_labels(var_names[0], meta)
+        vlabels = merge_value_labels(var_names, meta)
         row_labels = [label_for_value(val, vlabels) for val in all_vals]
 
         pct_matrix = []
@@ -893,12 +910,11 @@ def _compute_sig_pct(pct_matrix, col_ns, col_letters, num_break):
 
 # Alternate header fills for visual group separation
 _BANNER_FILLS = [
-    PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid'),  # blue
-    PatternFill(start_color='548235', end_color='548235', fill_type='solid'),  # green
-    PatternFill(start_color='BF8F00', end_color='BF8F00', fill_type='solid'),  # gold
-    PatternFill(start_color='C55A11', end_color='C55A11', fill_type='solid'),  # orange
-    PatternFill(start_color='7030A0', end_color='7030A0', fill_type='solid'),  # purple
-    PatternFill(start_color='2E75B6', end_color='2E75B6', fill_type='solid'),  # light blue
+    PatternFill(start_color='FFD400', end_color='FFD400', fill_type='solid'),  # Hendal yellow
+    PatternFill(start_color='BBCE00', end_color='BBCE00', fill_type='solid'),  # Hendal green
+    PatternFill(start_color='A693C6', end_color='A693C6', fill_type='solid'),  # Hendal purple
+    PatternFill(start_color='92D4F6', end_color='92D4F6', fill_type='solid'),  # Hendal light blue
+    PatternFill(start_color='CABB9F', end_color='CABB9F', fill_type='solid'),  # Hendal beige
 ]
 
 
@@ -1042,19 +1058,26 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
     show_sig_total: if True, Total column gets sig letters vs each category.
     Returns the next free row number.
     """
-    title_font = Font(name='Arial', size=11, bold=True)
-    header_font = Font(name='Arial', size=10, bold=True, color='FFFFFF')
-    data_font = Font(name='Arial', size=10)
-    base_font = Font(name='Arial', size=9, italic=True, color='666666')
-    letter_font = Font(name='Arial', size=8, bold=True, color='4472C4')
+    _fn = 'Calibri'
+    title_font = Font(name=_fn, size=11, bold=True, color='1D1D1B')
+    header_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
+    data_font = Font(name=_fn, size=10, color='1D1D1B')
+    base_font = Font(name=_fn, size=9, italic=True, color='888888')
+    letter_font = Font(name=_fn, size=8, bold=True, color='A693C6')
 
-    total_fill = PatternFill(start_color='D6DCE4', end_color='D6DCE4', fill_type='solid')
-    even_fill = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
-    sig_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+    total_fill = PatternFill(start_color='F4F7E0', end_color='F4F7E0', fill_type='solid')
+    even_fill = PatternFill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
+    sig_fill = PatternFill(start_color='E8F5FD', end_color='E8F5FD', fill_type='solid')
+    n_fill = PatternFill(start_color='F0EDE7', end_color='F0EDE7', fill_type='solid')
 
-    thick_side = Side(style='medium', color='333333')
-    thin_side = Side(style='thin', color='B4B4B4')
-    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    _line = Side(style='thin', color='E0DDD8')
+    _strong = Side(style='medium', color='1D1D1B')
+    _sep = Side(style='thin', color='CABB9F')
+    thin_border = Border(bottom=_line)
+    header_border = Border(bottom=_strong)
+    group_border = Border(left=_sep, bottom=_line)
+    group_header_border = Border(left=_sep, bottom=_strong)
+    n_border = Border(top=_sep, bottom=_strong)
 
     groups = banner['groups']
     row_labels = banner['row_labels']
@@ -1073,28 +1096,27 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                    end_row=row_num, end_column=n_total_cols)
     row_num += 1
 
-    # ── Header row: category labels ──
-    ws.cell(row=row_num, column=1, value='').border = thin_border
-    col_offset = 2  # first data column
+    # ── Header row: Total first, then category labels ──
+    ws.cell(row=row_num, column=1, value='').border = header_border
+    # Total column first (column 2)
+    cell = ws.cell(row=row_num, column=2, value='Total')
+    cell.font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
+    cell.fill = total_fill
+    cell.border = header_border
+    cell.alignment = Alignment(horizontal='center')
+    col_offset = 3  # groups start at column 3
     for gi, grp in enumerate(groups):
         fill = _BANNER_FILLS[gi % len(_BANNER_FILLS)]
         for ci, lbl in enumerate(grp['col_labels']):
             cell = ws.cell(row=row_num, column=col_offset + ci, value=lbl)
             cell.font = header_font
             cell.fill = fill
-            cell.border = thin_border
+            cell.border = header_border
             cell.alignment = Alignment(horizontal='center')
-            # Thick left border on first column of each group (visual separator)
-            if ci == 0 and gi > 0:
-                cell.border = Border(left=thick_side, right=thin_side,
-                                     top=thin_side, bottom=thin_side)
+            # Left border on first column of each group (visual separator)
+            if ci == 0:
+                cell.border = Border(left=_sep, bottom=_strong)
         col_offset += len(grp['col_labels'])
-    # Total column
-    cell = ws.cell(row=row_num, column=col_offset, value='Total')
-    cell.font = Font(name='Arial', size=10, bold=True)
-    cell.fill = total_fill
-    cell.border = thin_border
-    cell.alignment = Alignment(horizontal='center')
     row_num += 1
 
     # ── Pre-compute sig_total if needed ──
@@ -1114,7 +1136,9 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
             _gl = None
 
         ws.cell(row=row_num, column=1, value='').border = thin_border
-        col_offset = 2
+        # Total — empty at column 2
+        ws.cell(row=row_num, column=2, value='').border = thin_border
+        col_offset = 3
         flat_idx = 0
         for gi, grp in enumerate(groups):
             for ci, _per_grp_letter in enumerate(grp['col_letters']):
@@ -1130,13 +1154,10 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                 cell.font = letter_font
                 cell.border = thin_border
                 cell.alignment = Alignment(horizontal='center')
-                if ci == 0 and gi > 0:
-                    cell.border = Border(left=thick_side, right=thin_side,
-                                         top=thin_side, bottom=thin_side)
+                if ci == 0:
+                    cell.border = group_border
                 flat_idx += 1
             col_offset += len(grp['col_labels'])
-        # Total — empty
-        ws.cell(row=row_num, column=col_offset, value='').border = thin_border
         row_num += 1
 
     # ── Data rows ──
@@ -1148,16 +1169,45 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
         if is_even:
             cell.fill = even_fill
 
-        col_offset = 2
+        # Total column first (column 2)
+        cell = ws.cell(row=row_num, column=2)
+        cell.border = thin_border
+        cell.font = data_font
+        st_letters = sig_total_letters[ri] if sig_total_letters else ''
+        if is_numeric:
+            val_t = banner['total_means'][ri]
+            if st_letters:
+                cell.value = f"{val_t:.2f}\n{st_letters}"
+                cell.fill = sig_fill
+                cell.alignment = Alignment(horizontal='right', wrap_text=True)
+            else:
+                cell.value = val_t
+                cell.number_format = '0.00'
+                cell.alignment = Alignment(horizontal='right')
+        else:
+            pct_t = banner['total_pcts'][ri]
+            if pct_t == 0 and not st_letters:
+                cell.value = 0.0
+                cell.number_format = '0.0'
+                cell.alignment = Alignment(horizontal='right')
+            elif st_letters:
+                cell.value = f"{pct_t:.1f}\n{st_letters}"
+                cell.fill = sig_fill
+                cell.alignment = Alignment(horizontal='right', wrap_text=True)
+            else:
+                cell.value = pct_t
+                cell.number_format = '0.0'
+                cell.alignment = Alignment(horizontal='right')
+        if is_even and not st_letters:
+            cell.fill = even_fill
+
+        col_offset = 3
         flat_idx = 0
         for gi, grp in enumerate(groups):
             n_gcols = len(grp['col_labels'])
             for ci in range(n_gcols):
                 cell = ws.cell(row=row_num, column=col_offset + ci)
-                brd = thin_border
-                if ci == 0 and gi > 0:
-                    brd = Border(left=thick_side, right=thin_side,
-                                 top=thin_side, bottom=thin_side)
+                brd = group_border if ci == 0 else thin_border
                 cell.border = brd
 
                 # Check if this cell is sig different from Total
@@ -1218,83 +1268,48 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
 
             col_offset += n_gcols
 
-        # Total column
-        cell = ws.cell(row=row_num, column=col_offset)
-        cell.border = thin_border
-        cell.font = data_font
-        st_letters = sig_total_letters[ri] if sig_total_letters else ''
-        if is_numeric:
-            val_t = banner['total_means'][ri]
-            if st_letters:
-                cell.value = f"{val_t:.2f}\n{st_letters}"
-                cell.fill = sig_fill
-                cell.alignment = Alignment(horizontal='right', wrap_text=True)
-            else:
-                cell.value = val_t
-                cell.number_format = '0.00'
-                cell.alignment = Alignment(horizontal='right')
-        else:
-            pct_t = banner['total_pcts'][ri]
-            if pct_t == 0 and not st_letters:
-                cell.value = 0.0
-                cell.number_format = '0.0'
-                cell.alignment = Alignment(horizontal='right')
-            elif st_letters:
-                cell.value = f"{pct_t:.1f}\n{st_letters}"
-                cell.fill = sig_fill
-                cell.alignment = Alignment(horizontal='right', wrap_text=True)
-            else:
-                cell.value = pct_t
-                cell.number_format = '0.0'
-                cell.alignment = Alignment(horizontal='right')
-        if is_even and not st_letters:
-            cell.fill = even_fill
-
         row_num += 1
 
     # ── N row ──
     cell = ws.cell(row=row_num, column=1, value='N')
     cell.font = base_font
-    cell.border = thin_border
-    cell.fill = total_fill
-    col_offset = 2
+    cell.border = n_border
+    cell.fill = n_fill
+    # Total N first (column 2)
+    cell = ws.cell(row=row_num, column=2, value=round(banner['total_n']))
+    cell.font = base_font
+    cell.border = n_border
+    cell.fill = n_fill
+    cell.alignment = Alignment(horizontal='right')
+    col_offset = 3
     for gi, grp in enumerate(groups):
         for ci, n in enumerate(grp['col_ns']):
             cell = ws.cell(row=row_num, column=col_offset + ci, value=round(n))
             cell.font = base_font
-            cell.border = thin_border
-            cell.fill = total_fill
+            cell.border = n_border
+            cell.fill = n_fill
             cell.alignment = Alignment(horizontal='right')
-            if ci == 0 and gi > 0:
-                cell.border = Border(left=thick_side, right=thin_side,
-                                     top=thin_side, bottom=thin_side)
+            if ci == 0:
+                cell.border = Border(left=_sep, top=_sep, bottom=_strong)
         col_offset += len(grp['col_labels'])
-    # Total N
-    cell = ws.cell(row=row_num, column=col_offset, value=round(banner['total_n']))
-    cell.font = base_font
-    cell.border = thin_border
-    cell.fill = total_fill
-    cell.alignment = Alignment(horizontal='right')
     row_num += 1
 
     # ── Caption ──
     caption = banner.get('caption', '')
     if caption:
         cell = ws.cell(row=row_num, column=1, value=caption)
-        cell.font = Font(name='Arial', size=9, italic=True, color='666666')
+        cell.font = Font(name=_fn, size=9, italic=True, color='888888')
         row_num += 1
 
     # ── Legend (only if show_sig) ──
     if show_sig:
+        _leg_font = Font(name=_fn, size=8, italic=True, color='888888')
         row_num += 1
-        ws.cell(row=row_num, column=1, value='* small base (30≤n<50)').font = \
-            Font(name='Arial', size=8, italic=True, color='999999')
+        ws.cell(row=row_num, column=1, value='* small base (30≤n<50)').font = _leg_font
         row_num += 1
-        ws.cell(row=row_num, column=1, value='** very small base (n<30) — ineligible for sig testing').font = \
-            Font(name='Arial', size=8, italic=True, color='999999')
+        ws.cell(row=row_num, column=1, value='** very small base (n<30) — ineligible for sig testing').font = _leg_font
         row_num += 1
-        ws.cell(row=row_num, column=1, value='Significance test: z-test, 95% confidence').font = \
-            Font(name='Arial', size=8, italic=True, color='999999')
+        ws.cell(row=row_num, column=1, value='Significance test: z-test, 95% confidence').font = _leg_font
 
     # ── Column widths ──
     ws.column_dimensions['A'].width = 45
