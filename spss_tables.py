@@ -414,26 +414,27 @@ def write_tables_to_excel(tables, output_path, design='hendal'):
     """Pise sve tablice u Excel fajl s formatiranjem."""
     wb = Workbook()
     ws = wb.active
+    assert ws is not None
     ws.title = "Total Tables"
 
-    # ── Hendal design ──
-    _fn = 'Calibri'
-    title_font = Font(name=_fn, size=11, bold=True, color='1D1D1B')
-    header_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
-    data_font = Font(name=_fn, size=10, color='1D1D1B')
-    total_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
-    caption_font = Font(name=_fn, size=9, italic=True, color='888888')
+    t = _get_theme(design)
+    _fn = t['font']
+    title_font = Font(name=_fn, size=11, bold=True, color=t['title_color'])
+    header_font = Font(name=_fn, size=10, bold=True, color=t.get('header_color', t['title_color']))
+    data_font = Font(name=_fn, size=10, color=t['data_color'])
+    total_font = Font(name=_fn, size=10, bold=True, color=t['data_color'])
+    caption_font = Font(name=_fn, size=9, italic=True, color=t['caption_color'])
 
-    header_fill = PatternFill(start_color='FFD400', end_color='FFD400', fill_type='solid')
-    total_fill = PatternFill(start_color='F4F7E0', end_color='F4F7E0', fill_type='solid')
-    even_fill = PatternFill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
+    header_fill = PatternFill(start_color=t['header_fill'], end_color=t['header_fill'], fill_type='solid')
+    total_fill = PatternFill(start_color=t['total_fill'], end_color=t['total_fill'], fill_type='solid')
+    even_fill = PatternFill(start_color=t['even_fill'], end_color=t['even_fill'], fill_type='solid')
 
-    _line = Side(style='thin', color='E0DDD8')
+    _line = Side(style='thin', color=t['line_color'])
     no_border = Border()
     row_border = Border(bottom=_line)
-    header_border = Border(bottom=Side(style='medium', color='1D1D1B'))
-    total_border = Border(top=Side(style='thin', color='CABB9F'),
-                          bottom=Side(style='medium', color='1D1D1B'))
+    header_border = Border(bottom=Side(style='medium', color=t['strong_color']))
+    total_border = Border(top=Side(style='thin', color=t['sep_color']),
+                          bottom=Side(style='medium', color=t['strong_color']))
 
     # Track max widths per column
     col_widths = {}
@@ -483,17 +484,17 @@ def write_tables_to_excel(tables, output_path, design='hendal'):
                 cell = ws.cell(row=row_num, column=col_idx)
 
                 if val is None or val == '':
-                    cell.value = ''
+                    cell.value = ''  # type: ignore[assignment]
                 elif isinstance(val, str) and val == '.':
-                    cell.value = '.'
+                    cell.value = '.'  # type: ignore[assignment]
                 elif isinstance(val, float):
-                    cell.value = val
+                    cell.value = val  # type: ignore[assignment]
                     cell.number_format = '0' if col_idx in _n_cols else '0.0'
                 elif isinstance(val, (int, np.integer)):
-                    cell.value = int(val)
+                    cell.value = int(val)  # type: ignore[assignment]
                     cell.number_format = '#,##0'
                 else:
-                    cell.value = str(val)
+                    cell.value = str(val)  # type: ignore[assignment]
 
                 cell.font = total_font if is_total else data_font
                 cell.border = total_border if is_total else row_border
@@ -905,17 +906,71 @@ def _compute_sig_pct(pct_matrix, col_ns, col_letters, num_break):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  DESIGN THEMES
+# ═══════════════════════════════════════════════════════════════════
+
+DESIGN_THEMES = {
+    'hendal': {
+        'font': 'Calibri',
+        'title_color': '1D1D1B',
+        'header_color': '1D1D1B',
+        'data_color': '1D1D1B',
+        'caption_color': '888888',
+        'letter_color': 'A693C6',
+        'header_fill': 'FFD400',
+        'total_fill': 'F4F7E0',
+        'even_fill': 'F7F5F0',
+        'sig_fill': 'E8F5FD',
+        'n_fill': 'F0EDE7',
+        'line_color': 'E0DDD8',
+        'strong_color': '1D1D1B',
+        'sep_color': 'CABB9F',
+        'banner_fills': ['FFD400', 'BBCE00', 'A693C6', '92D4F6', 'CABB9F'],
+        'toc_header_fill': 'FFD400',
+        'toc_link_color': 'A693C6',
+        'toc_even_fill': 'F7F5F0',
+        'toc_line_color': 'E0DDD8',
+    },
+    'mate': {
+        'font': 'Calibri',
+        'title_color': '1A1A1A',
+        'header_color': 'FFFFFF',
+        'data_color': '1A1A1A',
+        'caption_color': '777777',
+        'letter_color': 'C0392B',
+        'header_fill': '1A1A1A',
+        'total_fill': 'F2DEDE',
+        'even_fill': 'F5F5F5',
+        'sig_fill': 'FADBD8',
+        'n_fill': 'E8E8E8',
+        'line_color': 'D5D5D5',
+        'strong_color': '1A1A1A',
+        'sep_color': 'C0392B',
+        'banner_fills': ['C0392B', '1A1A1A', 'E74C3C', '7B241C', '922B21'],
+        'banner_header_color': 'FFFFFF',
+        'toc_header_fill': '1A1A1A',
+        'toc_header_color': 'FFFFFF',
+        'toc_link_color': 'C0392B',
+        'toc_even_fill': 'F5F5F5',
+        'toc_line_color': 'D5D5D5',
+    },
+}
+
+def _get_theme(design='hendal'):
+    return DESIGN_THEMES.get(design, DESIGN_THEMES['hendal'])
+
+def _banner_fills(design='hendal'):
+    t = _get_theme(design)
+    return [PatternFill(start_color=c, end_color=c, fill_type='solid')
+            for c in t['banner_fills']]
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  BANNER: Merge multiple crosstabs into one wide table
 # ═══════════════════════════════════════════════════════════════════
 
-# Alternate header fills for visual group separation
-_BANNER_FILLS = [
-    PatternFill(start_color='FFD400', end_color='FFD400', fill_type='solid'),  # Hendal yellow
-    PatternFill(start_color='BBCE00', end_color='BBCE00', fill_type='solid'),  # Hendal green
-    PatternFill(start_color='A693C6', end_color='A693C6', fill_type='solid'),  # Hendal purple
-    PatternFill(start_color='92D4F6', end_color='92D4F6', fill_type='solid'),  # Hendal light blue
-    PatternFill(start_color='CABB9F', end_color='CABB9F', fill_type='solid'),  # Hendal beige
-]
+# Default banner fills (hendal) — kept for backward compat
+_BANNER_FILLS = _banner_fills('hendal')
 
 
 def merge_crosstabs_banner(crosstabs):
@@ -1051,28 +1106,31 @@ def compute_sig_total_banner(banner):
 
 
 def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
-                          show_sig_total=False):
+                          show_sig_total=False, design='hendal'):
     """
     Write a merged banner crosstab to an Excel sheet.
     All banner groups side by side, with visual separation, one Total column.
     show_sig_total: if True, Total column gets sig letters vs each category.
     Returns the next free row number.
     """
-    _fn = 'Calibri'
-    title_font = Font(name=_fn, size=11, bold=True, color='1D1D1B')
-    header_font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
-    data_font = Font(name=_fn, size=10, color='1D1D1B')
-    base_font = Font(name=_fn, size=9, italic=True, color='888888')
-    letter_font = Font(name=_fn, size=8, bold=True, color='A693C6')
+    t = _get_theme(design)
+    _fn = t['font']
+    title_font = Font(name=_fn, size=11, bold=True, color=t['title_color'])
+    header_font = Font(name=_fn, size=10, bold=True, color=t.get('header_color', t['title_color']))
+    _banner_hdr_color = t.get('banner_header_color', t.get('header_color', t['title_color']))
+    data_font = Font(name=_fn, size=10, color=t['data_color'])
+    base_font = Font(name=_fn, size=9, italic=True, color=t['caption_color'])
+    letter_font = Font(name=_fn, size=8, bold=True, color=t['letter_color'])
 
-    total_fill = PatternFill(start_color='F4F7E0', end_color='F4F7E0', fill_type='solid')
-    even_fill = PatternFill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
-    sig_fill = PatternFill(start_color='E8F5FD', end_color='E8F5FD', fill_type='solid')
-    n_fill = PatternFill(start_color='F0EDE7', end_color='F0EDE7', fill_type='solid')
+    total_fill = PatternFill(start_color=t['total_fill'], end_color=t['total_fill'], fill_type='solid')
+    even_fill = PatternFill(start_color=t['even_fill'], end_color=t['even_fill'], fill_type='solid')
+    sig_fill = PatternFill(start_color=t['sig_fill'], end_color=t['sig_fill'], fill_type='solid')
+    n_fill = PatternFill(start_color=t['n_fill'], end_color=t['n_fill'], fill_type='solid')
+    _active_banner_fills = _banner_fills(design)
 
-    _line = Side(style='thin', color='E0DDD8')
-    _strong = Side(style='medium', color='1D1D1B')
-    _sep = Side(style='thin', color='CABB9F')
+    _line = Side(style='thin', color=t['line_color'])
+    _strong = Side(style='medium', color=t['strong_color'])
+    _sep = Side(style='thin', color=t['sep_color'])
     thin_border = Border(bottom=_line)
     header_border = Border(bottom=_strong)
     group_border = Border(left=_sep, bottom=_line)
@@ -1100,16 +1158,16 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
     ws.cell(row=row_num, column=1, value='').border = header_border
     # Total column first (column 2)
     cell = ws.cell(row=row_num, column=2, value='Total')
-    cell.font = Font(name=_fn, size=10, bold=True, color='1D1D1B')
+    cell.font = Font(name=_fn, size=10, bold=True, color=t['data_color'])
     cell.fill = total_fill
     cell.border = header_border
     cell.alignment = Alignment(horizontal='center')
     col_offset = 3  # groups start at column 3
     for gi, grp in enumerate(groups):
-        fill = _BANNER_FILLS[gi % len(_BANNER_FILLS)]
+        fill = _active_banner_fills[gi % len(_active_banner_fills)]
         for ci, lbl in enumerate(grp['col_labels']):
             cell = ws.cell(row=row_num, column=col_offset + ci, value=lbl)
-            cell.font = header_font
+            cell.font = Font(name=_fn, size=10, bold=True, color=_banner_hdr_color)
             cell.fill = fill
             cell.border = header_border
             cell.alignment = Alignment(horizontal='center')
@@ -1298,12 +1356,12 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
     caption = banner.get('caption', '')
     if caption:
         cell = ws.cell(row=row_num, column=1, value=caption)
-        cell.font = Font(name=_fn, size=9, italic=True, color='888888')
+        cell.font = Font(name=_fn, size=9, italic=True, color=t['caption_color'])
         row_num += 1
 
     # ── Legend (only if show_sig) ──
     if show_sig:
-        _leg_font = Font(name=_fn, size=8, italic=True, color='888888')
+        _leg_font = Font(name=_fn, size=8, italic=True, color=t['caption_color'])
         row_num += 1
         ws.cell(row=row_num, column=1, value='* small base (30≤n<50)').font = _leg_font
         row_num += 1

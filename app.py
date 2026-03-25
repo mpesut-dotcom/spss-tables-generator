@@ -479,6 +479,20 @@ def validate_datafile(df, meta, input_vars=None):
                 'row': None, 'snippet': None,
             })
 
+    # 1b. Empty variables — all values are NaN (won't appear in banner, filters, etc.)
+    for v_lower in _input_vars:
+        actual = col_lower_map.get(v_lower)
+        if not actual or actual not in df.columns:
+            continue
+        if df[actual].dropna().empty:
+            lbl = labels_dict.get(actual, '')
+            disp = f"{actual} ({lbl})" if lbl and lbl != actual else actual
+            warnings_list.append({
+                'level': 'warning',
+                'msg': f"{disp}: varijabla je potpuno prazna (svi redovi su NaN) — neće se pojaviti u banner/filter opcijama",
+                'row': None, 'snippet': None,
+            })
+
     # 2. Inconsistent value labels within a variable group
     for base, var_list in _base_groups.items():
         if len(var_list) < 2:
@@ -909,17 +923,15 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
 def _auto_sheet_name(out_type, banner_indices, cat_var_names, use_weight):
     """Generate automatic sheet name from output type and banner selection."""
     if out_type == 'total':
-        base = 'total'
+        base = 'TOTAL'
     elif not banner_indices:
-        base = 'kriz'
+        base = 'CROSS'
     else:
         parts = []
         for bi in banner_indices:
             if bi < len(cat_var_names):
                 parts.append(cat_var_names[bi].lower())
-        base = ('kriz_' + '_'.join(parts)) if parts else 'kriz'
-    if use_weight:
-        base += '_pond'
+        base = ('CROSS_' + '_'.join(parts)) if parts else 'CROSS'
     return base
 
 
@@ -1009,7 +1021,7 @@ def main():
     def _reset_data():
         """Clear loaded data files from session, keep outputs."""
         for k in list(st.session_state.keys()):
-            if k.startswith(('df', 'meta', '_sav', 'titles', 'variables',
+            if k.startswith(('df', 'meta', '_sav', 'titles', 'variables',  # type: ignore[union-attr]
                              'break_vars', '_input', 'var_groups',
                              '_plan_applied', '_pending_plan')):
                 del st.session_state[k]
@@ -1171,7 +1183,7 @@ def main():
 
     # ── Validacija datafile-a ──
     _input_var_set = set()
-    for var_line in variables:
+    for var_line in variables:  # type: ignore[union-attr]
         var_line_s = var_line.strip()
         if var_line_s.startswith('$'):
             _input_var_set.update(p.lower() for p in var_line_s.split() if not p.startswith('$') and p != "''")
@@ -1253,8 +1265,8 @@ def main():
     st.subheader("🎨 Dizajn tablica")
     table_design = st.selectbox(
         "Stil:",
-        options=['hendal'],
-        format_func=lambda x: {'hendal': '🟡 Hendal'}[x],
+        options=['hendal', 'mate'],
+        format_func=lambda x: {'hendal': '🟡 Hendal', 'mate': '🐉 Mate'}[x],
         key="table_design",
     )
 
@@ -1383,7 +1395,7 @@ def main():
             st.session_state['n_outputs'] = n - 1
 
     def _duplicate_output(src):
-        """Copy all session_state keys from output *src* to a new output at the end."""
+        """Copy all session_state keys from output *src* to a new output after src."""
         n = st.session_state['n_outputs']
         st.session_state['n_outputs'] = n + 1
         dst = n  # 0-based index of the new output
@@ -1410,6 +1422,12 @@ def main():
                 k_src = fg_tpl.format(src, fi)
                 if k_src in st.session_state:
                     st.session_state[fg_tpl.format(dst, fi)] = st.session_state[k_src]
+
+        # Insert duplicate right after source in display order
+        order = st.session_state.get('_out_order', list(range(n)))
+        src_pos = order.index(src) if src in order else len(order)
+        order.insert(src_pos + 1, dst)
+        st.session_state['_out_order'] = order
 
     output_defs = []
 
@@ -1745,7 +1763,7 @@ def main():
                 '#': i + start_num,
                 'Tip': type_names.get(tt, tt),
                 'Naslov': tn[:80],
-                'Var': variables[i][:50] if i < len(variables) else '',
+                'Var': variables[i][:50] if i < len(variables) else '',  # type: ignore[arg-type]
             })
         st.dataframe(preview_data, use_container_width=True, hide_index=True)
 
@@ -1754,11 +1772,11 @@ def main():
         st.markdown("**Primjeri stvarnih tablica** (prvih 5)")
         col_map = build_column_map(df)
         _shown = 0
-        for i in range(min(len(titles), len(variables))):
+        for i in range(min(len(titles), len(variables))):  # type: ignore[arg-type]
             if _shown >= 5:
                 break
             title_line = titles[i]
-            var_line = variables[i]
+            var_line = variables[i]  # type: ignore[index]
             tt = get_table_type(title_line)
             tn = get_table_title(title_line)
             try:
@@ -1803,7 +1821,7 @@ def main():
         from openpyxl import Workbook as _Workbook
         wb = _Workbook()
         # Ukloni default sheet
-        wb.remove(wb.active)
+        wb.remove(wb.active)  # type: ignore[arg-type]
         existing_sheets = []
 
         total_tables = 0
@@ -1823,7 +1841,7 @@ def main():
                 _ttype = get_table_type(titles[_ti])
                 _ttitle = get_table_title(titles[_ti])
                 _stripped = _ttitle.rstrip()
-                _is_t2b = _stripped.endswith('- T2B')
+                _is_t2b = '- T2B' in _stripped
                 _is_mean = _ttype in ('n', 'm')
 
                 if _is_mean:
@@ -1831,7 +1849,7 @@ def main():
                     _mean_var = _mv.group(1).rstrip('.:') if _mv else ''
                     _mean_pending.append((_ti, _mean_var))
                 elif _is_t2b:
-                    _base = _stripped[:-5].rstrip()  # remove "- T2B"
+                    _base = _stripped[:_stripped.index('- T2B')].rstrip()  # remove "- T2B" and everything after
                     if _base in _base_to_row:
                         toc_rows[_base_to_row[_base]]['t2b_idx'] = _ti
                     else:
@@ -1860,8 +1878,8 @@ def main():
                             _matched = True
                 if not _matched:
                     _mt = get_table_title(titles[_mi]).rstrip()
-                    if _mt.endswith('- MEAN'):
-                        _mt = _mt[:-6].rstrip()
+                    if '- MEAN' in _mt:
+                        _mt = _mt[:_mt.index('- MEAN')].rstrip()
                     if _mt not in _base_to_row:
                         _base_to_row[_mt] = len(toc_rows)
                         toc_rows.append({'title': _mt, 'regular_idx': None,
@@ -1900,7 +1918,7 @@ def main():
                 import tempfile as _tmpmod
                 with _tmpmod.NamedTemporaryFile(suffix='.xlsx', delete=False) as _tf:
                     _tf_path = _tf.name
-                write_tables_to_excel(tables, _tf_path)
+                write_tables_to_excel(tables, _tf_path, design=table_design)
                 _twb = load_workbook(_tf_path)
                 for _srcws in _twb.worksheets:
                     sname = _unique_name(out_def['sheet_name'])
@@ -1980,7 +1998,7 @@ def main():
 
                 for ti in tbl_indices:
                     title_line = titles[ti]
-                    var_line = variables[ti]
+                    var_line = variables[ti]  # type: ignore[index]
                     table_type = get_table_type(title_line)
                     table_title = get_table_title(title_line)
                     table_num = ti + start_num
@@ -2035,14 +2053,16 @@ def main():
                     # Write to plain sheet (no sig)
                     current_row = write_banner_to_sheet(
                         ws, banner, title_str,
-                        start_row=current_row, show_sig=False)
+                        start_row=current_row, show_sig=False,
+                        design=table_design)
                     current_row += 2
 
                     # Write to sig sheet (with sig)
                     if ws_sig is not None:
                         current_row_sig = write_banner_to_sheet(
                             ws_sig, banner, title_str,
-                            start_row=current_row_sig, show_sig=True)
+                            start_row=current_row_sig, show_sig=True,
+                            design=table_design)
                         current_row_sig += 2
 
                     # Write to sig_total sheet (sig on Total column)
@@ -2050,21 +2070,23 @@ def main():
                         current_row_st = write_banner_to_sheet(
                             ws_sig_total, banner, title_str,
                             start_row=current_row_st, show_sig=True,
-                            show_sig_total=True)
+                            show_sig_total=True, design=table_design)
                         current_row_st += 2
 
         # ── TOC sheet (question-centric) ──
         if add_toc and toc_rows:
             import re as _re
             from openpyxl.styles import Font as _Font, PatternFill as _Fill, Alignment as _Align, Border, Side
+            from spss_tables import _get_theme
+            _toc_t = _get_theme(table_design)
             toc_ws = wb.create_sheet("TOC (BETA)", 0)
 
-            _hfont = _Font(name='Calibri', size=11, bold=True, color='1D1D1B')
-            _hfill = _Fill(start_color='FFD400', end_color='FFD400', fill_type='solid')
-            _lfont = _Font(name='Calibri', size=10, color='A693C6', underline='single')
-            _dfont = _Font(name='Calibri', size=10, color='1D1D1B')
-            _even_fill = _Fill(start_color='F7F5F0', end_color='F7F5F0', fill_type='solid')
-            _brd = Border(bottom=Side(style='thin', color='E0DDD8'))
+            _hfont = _Font(name='Calibri', size=11, bold=True, color=_toc_t.get('toc_header_color', _toc_t['title_color']))
+            _hfill = _Fill(start_color=_toc_t['toc_header_fill'], end_color=_toc_t['toc_header_fill'], fill_type='solid')
+            _lfont = _Font(name='Calibri', size=10, color=_toc_t['toc_link_color'], underline='single')
+            _dfont = _Font(name='Calibri', size=10, color=_toc_t['data_color'])
+            _even_fill = _Fill(start_color=_toc_t['toc_even_fill'], end_color=_toc_t['toc_even_fill'], fill_type='solid')
+            _brd = Border(bottom=Side(style='thin', color=_toc_t['toc_line_color']))
 
             def _var_name(title):
                 m = _re.match(r'^(\S+)', title.strip())
@@ -2212,8 +2234,11 @@ def main():
                     st.warning(e)
 
         # ── Download gumb ──
-        sav_base = os.path.splitext(sav_file.name)[0]
-        output_name = f"{sav_base}_tablice.xlsx"
+        sav_base = os.path.splitext(sav_file.name)[0]  # type: ignore[union-attr]
+        # Strip trailing version suffix (e.g. _v4, _V12) from project name
+        sav_base = re.sub(r'_[vV]\d+$', '', sav_base)
+        pond_part = '_pond' if use_weight else ''
+        output_name = f"{sav_base}_tables{pond_part}_v1.xlsx"
 
         st.download_button(
             label=f"⬇️ Preuzmi {output_name}",
