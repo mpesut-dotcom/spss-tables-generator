@@ -218,7 +218,7 @@ def make_simple_table(df, var_name, meta, col_map, weight_col=None):
     for val in all_values:
         lbl = label_for_value(val, val_labels) if val_labels else label_for_value(val, {})
         n = counts.get(val, 0)
-        pct = round(float(n) / float(total_n) * 100, 1) if total_n > 0 else 0.0
+        pct = round(float(n) / float(total_n) * 100, 5) if total_n > 0 else 0.0
         rows.append((str(lbl), round(float(n), 1), pct))
 
     rows.append(('Total', round(float(total_n), 1), 100.0))
@@ -274,7 +274,7 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
                 n = float(df.loc[mask, weight_col].sum())
             else:
                 n = int(mask.sum())
-            pct = round(float(n) / float(total_cases) * 100, 1) if total_cases > 0 else 0.0
+            pct = round(float(n) / float(total_cases) * 100, 5) if total_cases > 0 else 0.0
             rows.append((str(label), round(float(n), 1), pct))
     else:
         # MDGROUP ('d'): rows = variables, labels = variable labels
@@ -285,7 +285,7 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
                 n = float(df.loc[mask, weight_col].sum())
             else:
                 n = int(mask.sum())
-            pct = round(float(n) / float(total_cases) * 100, 1) if total_cases > 0 else 0.0
+            pct = round(float(n) / float(total_cases) * 100, 5) if total_cases > 0 else 0.0
             rows.append((str(label), round(float(n), 1), pct))
 
     rows.append(('Total*', round(float(total_cases), 1), ''))
@@ -393,8 +393,8 @@ def make_freq_table(df, var_name, meta, col_map, weight_col=None):
     for val, n in counts.items():
         lbl = label_for_value(val, val_labels) if val_labels else label_for_value(val, {})
         n_val = float(n)
-        pct = round(n_val / total_n * 100, 1) if total_n > 0 else 0.0
-        cum_pct = round(cum_pct + pct, 1)
+        pct = round(n_val / total_n * 100, 5) if total_n > 0 else 0.0
+        cum_pct = round(cum_pct + pct, 5)
         rows.append((str(lbl), round(n_val, 1), pct, cum_pct))
 
     rows.append(('Total', round(total_n, 1), 100.0, 100.0))
@@ -639,7 +639,7 @@ def make_crosstab_simple(df, var_name, break_var, meta, col_map, weight_col=None
                 n = float(subset.loc[mask, weight_col].sum())
             else:
                 n = int(mask.sum())
-            pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
+            pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
             row_pcts.append(pct)
         # Total %
         mask_total = subset[actual_col] == val
@@ -647,7 +647,7 @@ def make_crosstab_simple(df, var_name, break_var, meta, col_map, weight_col=None
             n_total = float(subset.loc[mask_total, weight_col].sum())
         else:
             n_total = int(mask_total.sum())
-        pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
+        pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
         row_pcts.append(pct_total)
         pct_matrix.append(row_pcts)
 
@@ -720,14 +720,14 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
+                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
+            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
     else:
@@ -743,14 +743,14 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / col_ns[ci] * 100, 1) if col_ns[ci] > 0 else 0.0
+                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / col_ns[-1] * 100, 1) if col_ns[-1] > 0 else 0.0
+            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
 
