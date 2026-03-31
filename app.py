@@ -717,12 +717,19 @@ def apply_filter_groups(df, filter_groups):
             logic = grp.get('logic', 'AND')
 
             if mode == 'multi':
-                # vals su imena sub-varijabli; ispitanik prolazi ako ima
-                # ne-NaN i != 0 u barem jednoj od odabranih sub-varijabli
+                # vals su kodovi; vars su stupci u grupi
+                # ispitanik prolazi ako ima odabranu vrijednost u bilo kojem stupcu
+                grp_vars = grp.get('vars', [])
+                cmp_vals = []
+                for v in vals:
+                    try:
+                        cmp_vals.append(float(v))
+                    except (ValueError, TypeError):
+                        cmp_vals.append(v)
                 grp_mask = pd.Series(False, index=df.index)
-                for sv in vals:
+                for sv in grp_vars:
                     if sv in df.columns:
-                        grp_mask = grp_mask | (df[sv].notna() & (df[sv] != 0))
+                        grp_mask = grp_mask | df[sv].isin(cmp_vals)
             else:
                 # single: vals su vrijednosti jedne varijable
                 var = grp['var']
@@ -835,7 +842,7 @@ def collect_plan(output_defs, use_weight, weight_col, start_num):
             out['show_sig'] = od.get('show_sig', False)
             out['show_sig_total'] = od.get('show_sig_total', False)
             out['table_indices'] = od.get('table_indices', [])
-            out['table_mode'] = od.get('table_mode', 'all')
+            out['table_mode'] = st.session_state.get(f'out_tblmode_{oi}', 'all')
         plan['outputs'].append(out)
     return plan
 
@@ -844,9 +851,7 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
                         all_tbl_indices, df, val_labels_dict):
     """Set session_state keys for outputs from a loaded plan."""
     outputs = plan.get('outputs', [])
-    n = max(len(outputs), 1)
-    st.session_state['n_outputs'] = n
-    st.session_state['_out_order'] = list(range(n))
+    st.session_state['n_outputs'] = max(len(outputs), 1)
 
     for oi, out in enumerate(outputs):
         st.session_state[f'out_type_{oi}'] = out.get('type', 'total')
@@ -980,7 +985,7 @@ def main():
         """)
 
         st.divider()
-        st.caption("Hendalice v2.2")
+        st.caption("Hendalice v2.3")
 
     # ── Custom CSS ──
     st.markdown("""
@@ -1066,7 +1071,7 @@ def main():
 
     def _reset_settings():
         """Clear plan, outputs & settings — keep data files."""
-        prev_order = st.session_state.get('_out_order', [0])
+        n_prev = st.session_state.get('n_outputs', 1)
         # Remove plan
         for k in list(st.session_state.keys()):
             if k.startswith(('_plan_applied', '_pending_plan')):  # type: ignore[union-attr]
@@ -1078,34 +1083,49 @@ def main():
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
         # Reset outputs
-        for oi in prev_order:
-            st.session_state.pop(f'out_type_{oi}', None)
-            st.session_state.pop(f'out_filt_{oi}', None)
+        st.session_state['n_outputs'] = 1
+        st.session_state['_out_order'] = [0]
+        for oi in range(max(n_prev, 1)):
+            st.session_state[f'out_type_{oi}'] = 'total'
+            st.session_state[f'out_filt_{oi}'] = False
             st.session_state.pop(f'out_sig_{oi}', None)
-            st.session_state.pop(f'out_sigtot_{oi}', None)
-            st.session_state.pop(f'out_banner_{oi}', None)
-            st.session_state.pop(f'out_name_dirty_{oi}', None)
+            st.session_state[f'out_sigtot_{oi}'] = False
+            st.session_state[f'out_banner_{oi}'] = []
+            st.session_state[f'out_name_dirty_{oi}'] = False
             for k in (f'out_name_{oi}', f'out_autoname_{oi}',
                       f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
                       f'n_fg_{oi}'):
                 st.session_state.pop(k, None)
-        st.session_state['n_outputs'] = 1
-        st.session_state['_out_order'] = [0]
         st.session_state.pop('_widget_snap', None)
 
     def _reset_all():
         """Clear everything — data, outputs, all settings."""
         dgen = st.session_state.get('_data_ugen', 0) + 1
         pgen = st.session_state.get('_plan_ugen', 0) + 1
+        n_prev = st.session_state.get('n_outputs', 1)
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.session_state['_data_ugen'] = dgen
         st.session_state['_plan_ugen'] = pgen
+        # Explicitly set widget keys to defaults so Streamlit's internal
+        # widget cache is overridden on next render
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
+        # Reset output widgets for all previously active outputs
+        for oi in range(max(n_prev, 1)):
+            st.session_state[f'out_type_{oi}'] = 'total'
+            st.session_state[f'out_filt_{oi}'] = False
+            st.session_state.pop(f'out_sig_{oi}', None)
+            st.session_state[f'out_sigtot_{oi}'] = False
+            st.session_state[f'out_banner_{oi}'] = []
+            st.session_state[f'out_name_dirty_{oi}'] = False
+            for k in (f'out_name_{oi}', f'out_autoname_{oi}',
+                      f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
+                      f'n_fg_{oi}'):
+                st.session_state.pop(k, None)
 
     hdr1, _, btn_rd, btn_rs, btn_ra = st.columns([6, 0.5, 1.2, 1.2, 1.2])
     with hdr1:
@@ -1355,27 +1375,49 @@ def main():
     all_tbl_indices = [to[0] for to in table_options]
     all_tbl_displays = [to[1] for to in table_options]
 
-    # Filter choices (prepared once, reused per output)
+    # Filter choices — built from input script titles for accurate labels
     filter_choices = []
-    for gk, gv in var_groups.items():
-        is_mr = gv['types'] & {'k', 'd'}
-        if is_mr and len(gv['vars']) > 1:
-            filter_choices.append({
-                'display': f"{gv['label']}",
-                'group_key': gk,
-                'mode': 'multi',
-                'vars': gv['vars'],
-            })
-        else:
-            for v in gv['vars']:
-                var_lbl = labels_dict.get(v) or ''
-                if var_lbl and var_lbl != v:
-                    disp = f"{gv['label']} — {var_lbl[:50]}"
-                else:
-                    disp = f"{gv['label']} — {v}"
+    _filt_seen_vars = set()
+    col_set_lc = {c.lower(): c for c in df.columns}
+    for i, (title_line, var_line) in enumerate(zip(titles, variables)):  # type: ignore[arg-type]
+        ttype = get_table_type(title_line)
+        ttitle = get_table_title(title_line)
+        actual_vars = _extract_vars_from_line(var_line)
+        resolved = [col_set_lc[v.lower()] for v in actual_vars if v.lower() in col_set_lc]
+        if not resolved:
+            continue
+        # Multi-response (k/d) → one multi-select entry
+        if ttype in ('k', 'd') and len(resolved) > 1:
+            key = frozenset(resolved)
+            if key not in _filt_seen_vars:
+                _filt_seen_vars.add(key)
                 filter_choices.append({
-                    'display': disp,
-                    'group_key': gk,
+                    'display': f"T{i+start_num} [{ttype}] {ttitle}",
+                    'mode': 'multi',
+                    'vars': resolved,
+                })
+        else:
+            # Single var — use input script title
+            v = resolved[0]
+            if v not in _filt_seen_vars:
+                _filt_seen_vars.add(v)
+                filter_choices.append({
+                    'display': f"T{i+start_num} [{ttype}] {ttitle}",
+                    'mode': 'single',
+                    'vars': [v],
+                })
+    # Ostale varijable iz datafile-a koje nisu u inputu
+    _used_vars = set()
+    for fc in filter_choices:
+        _used_vars.update(fc['vars'])
+    for v in df.columns:
+        if v not in _used_vars:
+            nunique = df[v].dropna().nunique()
+            if 2 <= nunique <= 30:
+                lbl = labels_dict.get(v) or ''
+                disp = f"{v} — {lbl}" if lbl and lbl != v else v
+                filter_choices.append({
+                    'display': f"[df] {disp}",
                     'mode': 'single',
                     'vars': [v],
                 })
@@ -1398,17 +1440,21 @@ def main():
 
     def _reset_outputs():
         """Reset all outputs back to a single Total."""
-        order = st.session_state.get('_out_order', [0])
-        for oi in order:
+        n = st.session_state.get('n_outputs', 1)
+        for oi in range(n):
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
                             'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
-                st.session_state.pop(key_tpl.format(oi), None)
+                k = key_tpl.format(oi)
+                if k in st.session_state:
+                    del st.session_state[k]
             # Also clean filter group keys
             for fi in range(st.session_state.get(f'n_fg_{oi}', 0) + 1):
                 for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
-                    st.session_state.pop(fg_tpl.format(oi, fi), None)
+                    k = fg_tpl.format(oi, fi)
+                    if k in st.session_state:
+                        del st.session_state[k]
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
 
@@ -1425,29 +1471,30 @@ def main():
         st.session_state['n_outputs'] = 1
 
     def _add_output():
-        n = st.session_state.get('n_outputs', 1)
+        n = st.session_state['n_outputs']
         st.session_state['n_outputs'] = n + 1
+        # Add new item to order
         order = st.session_state.get('_out_order', list(range(n)))
         order.append(n)
         st.session_state['_out_order'] = order
 
-    def _delete_output(target):
-        """Remove a specific output by its logical index."""
-        order = st.session_state.get('_out_order', [0])
-        if len(order) <= 1:
-            return
-        order = [x for x in order if x != target]
-        # Clean session keys for deleted output
-        for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                        'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
-                        'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
-                        'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
-            st.session_state.pop(key_tpl.format(target), None)
-        # Clean filter group keys
-        for fi in range(st.session_state.get(f'n_fg_{target}', 0) + 1):
-            for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
-                st.session_state.pop(fg_tpl.format(target, fi), None)
-        st.session_state['_out_order'] = order
+    def _remove_output():
+        n = st.session_state['n_outputs']
+        if n > 1:
+            # Remove the last logical index from order
+            order = st.session_state.get('_out_order', list(range(n)))
+            removed = n - 1
+            order = [x for x in order if x != removed]
+            # Clean session keys for removed output
+            for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
+                            'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
+                k = key_tpl.format(removed)
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.session_state['_out_order'] = order
+            st.session_state['n_outputs'] = n - 1
 
     def _duplicate_output(src):
         """Copy all session_state keys from output *src* to a new output after src."""
@@ -1486,12 +1533,18 @@ def main():
 
     output_defs = []
 
-    # ── Order is the source of truth ──
+    n_out_total = st.session_state['n_outputs']
+
+    # ── Arrow-based reordering ──
     if '_out_order' not in st.session_state:
-        st.session_state['_out_order'] = [0]
-        st.session_state['n_outputs'] = 1
-    order = list(st.session_state['_out_order'])  # copy
-    n_out_total = len(order)
+        st.session_state['_out_order'] = list(range(n_out_total))
+    order = st.session_state['_out_order']
+    # Ensure order is consistent with n_outputs
+    existing = set(range(n_out_total))
+    order = [x for x in order if x in existing]
+    for x in existing - set(order):
+        order.append(x)
+    st.session_state['_out_order'] = order
 
     def _swap_outputs(pos_a, pos_b):
         """Swap two outputs by their position in the order list."""
@@ -1500,40 +1553,28 @@ def main():
         st.session_state['_out_order'] = o
 
     for pos, oi in enumerate(order):
-        # ── Build compact summary for expander label ──
-        _otype = st.session_state.get(f'out_type_{oi}', 'total')
-        _oname = st.session_state.get(f'out_name_{oi}', '')
-        _oicon = '📋' if _otype == 'total' else '📊'
-        _olabel = f"Output {pos + 1}:  {_oicon} {_otype.capitalize()} — {_oname}" if _oname else f"Output {pos + 1}:  {_oicon} {_otype.capitalize()}"
-
-        with st.expander(_olabel, expanded=(n_out_total == 1 or oi == order[-1])):
-            # ── Action buttons row ──
+        with st.container(border=True):
+            # ── Header: Output N ──
             if n_out_total > 1:
-                _c_up, _c_dn, _c_dup, _c_del, _ = st.columns([0.4, 0.4, 0.4, 0.4, 5])
-                with _c_up:
+                up_col, dn_col, h_col, type_col, name_col, reset_col, dup_col = st.columns([0.18, 0.18, 0.7, 2, 2, 0.35, 0.35])
+                with up_col:
                     st.button("▲", key=f"up_{oi}", disabled=(pos == 0),
                               on_click=_swap_outputs, args=(pos, pos - 1),
                               help="Pomakni gore")
-                with _c_dn:
+                with dn_col:
                     st.button("▼", key=f"dn_{oi}", disabled=(pos == n_out_total - 1),
                               on_click=_swap_outputs, args=(pos, pos + 1),
                               help="Pomakni dolje")
-                with _c_dup:
-                    st.button("📋", key=f"dup_{oi}",
-                              on_click=_duplicate_output, args=(oi,),
-                              help="Dupliciraj")
-                with _c_del:
-                    st.button("🗑️", key=f"del_{oi}",
-                              on_click=_delete_output, args=(oi,),
-                              help="Obriši ovaj output")
             else:
-                _c_dup, _ = st.columns([0.4, 5])
-                with _c_dup:
-                    st.button("📋", key=f"dup_{oi}",
-                              on_click=_duplicate_output, args=(oi,),
-                              help="Dupliciraj")
+                h_col, type_col, name_col, reset_col, dup_col = st.columns([0.8, 2, 2, 0.35, 0.35])
 
-            type_col, name_col, reset_col = st.columns([2, 2, 0.35])
+            with h_col:
+                st.markdown(f"### Output {pos + 1}")
+
+            with dup_col:
+                st.button("📋", key=f"dup_{oi}",
+                          on_click=_duplicate_output, args=(oi,),
+                          help="Dupliciraj ovaj output")
 
             with type_col:
                 out_type = st.selectbox(
@@ -1614,32 +1655,66 @@ def main():
                         c_var, c_vals = st.columns([2, 3])
 
                         with c_var:
+                            def _on_fg_var_change(_oi=oi, _fi=fi):
+                                vals_key = f'fg_vals_{_oi}_{_fi}'
+                                if vals_key in st.session_state:
+                                    st.session_state[vals_key] = []
+
                             choice_idx = st.selectbox(
                                 "Pitanje",
                                 options=range(len(filter_choices)),
                                 format_func=lambda i, cd=choice_displays: cd[i],
                                 key=f"fg_var_{oi}_{fi}",
                                 label_visibility="collapsed",
+                                on_change=_on_fg_var_change,
                             )
                             chosen = filter_choices[choice_idx]
 
                         with c_vals:
                             if chosen['mode'] == 'multi':
+                                # Collect all unique values + labels across all vars in group
                                 sub_vars = chosen['vars']
-                                sub_displays = [labels_dict.get(sv, sv)
-                                                for sv in sub_vars]
+                                _all_vals_set = set()
+                                _val_label_map = {}
+                                for sv in sub_vars:
+                                    for uv in df[sv].dropna().unique():
+                                        _all_vals_set.add(uv)
+                                    svl = val_labels_dict.get(sv, {})
+                                    for code, lbl in svl.items():
+                                        if lbl:
+                                            _val_label_map[code] = lbl
+                                try:
+                                    _all_vals = sorted(
+                                        _all_vals_set,
+                                        key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                                    )
+                                except TypeError:
+                                    _all_vals = sorted(_all_vals_set, key=str)
+
+                                def _mr_val_display(uv, vlm=_val_label_map):
+                                    lbl = vlm.get(uv, '')
+                                    if not lbl:
+                                        try:
+                                            lbl = vlm.get(int(uv) if isinstance(uv, float) and uv == int(uv) else uv, '')
+                                        except (ValueError, TypeError):
+                                            pass
+                                    return f"{uv} — {lbl}" if lbl else str(uv)
+
+                                _mr_displays = [_mr_val_display(v) for v in _all_vals]
+
                                 selected = st.multiselect(
-                                    "Opcije",
-                                    options=range(len(sub_vars)),
-                                    format_func=lambda i, sd=sub_displays: sd[i],
+                                    "Vrijednosti",
+                                    options=range(len(_all_vals)),
+                                    format_func=lambda i, md=_mr_displays: md[i],
                                     key=f"fg_vals_{oi}_{fi}",
                                     label_visibility="collapsed",
                                     placeholder="Odaberite...",
                                 )
-                                selected_vals = [sub_vars[i] for i in selected]
+                                selected_vals = [_all_vals[i] for i in selected]
                                 out_filter_groups.append({
                                     'mode': 'multi',
                                     'group_label': chosen['display'],
+                                    'vars': sub_vars,
                                     'vals': selected_vals,
                                     'logic': row_logic,
                                 })
@@ -1698,6 +1773,7 @@ def main():
             # ── Križanje specifično: banner + tablice ──
             banner_vars_sel = []
             show_sig = False
+            show_sig_total = False
             tbl_final_indices = list(all_tbl_indices)
 
             if out_type == 'krizanje':
@@ -1743,50 +1819,55 @@ def main():
                                                 key=f"out_sigtot_{oi}",
                                                 help="Generira dodatni sheet s _sig_total — Total stupac se testira protiv svake kategorije")
 
-                    tbl_mode = st.radio(
-                        "Tablice:",
-                        options=['all', 'exclude', 'select'],
-                        format_func=lambda m: {
-                            'all': f'Sve ({len(table_options)})',
-                            'exclude': 'Sve osim isključenih',
-                            'select': 'Samo odabrane',
-                        }[m],
-                        key=f"out_tblmode_{oi}",
-                        horizontal=True,
-                    )
+            # ── Odabir tablica (za oba tipa) ──
+            if table_options:
+                tbl_mode = st.radio(
+                    "Tablice:",
+                    options=['all', 'exclude', 'select'],
+                    format_func=lambda m: {
+                        'all': f'Sve ({len(table_options)})',
+                        'exclude': 'Sve osim isključenih',
+                        'select': 'Samo odabrane',
+                    }[m],
+                    key=f"out_tblmode_{oi}",
+                    horizontal=True,
+                )
 
-                    if tbl_mode == 'exclude':
-                        excluded = st.multiselect(
-                            "Isključi:",
-                            options=range(len(table_options)),
-                            format_func=lambda i, td=all_tbl_displays: td[i],
-                            key=f"out_excl_{oi}",
-                        )
-                        tbl_final_indices = [all_tbl_indices[j] for j in range(len(table_options)) if j not in excluded]
-                    elif tbl_mode == 'select':
-                        selected = st.multiselect(
-                            "Odaberi:",
-                            options=range(len(table_options)),
-                            format_func=lambda i, td=all_tbl_displays: td[i],
-                            key=f"out_sel_{oi}",
-                        )
-                        tbl_final_indices = [all_tbl_indices[j] for j in selected]
+                if tbl_mode == 'exclude':
+                    excluded = st.multiselect(
+                        "Isključi:",
+                        options=range(len(table_options)),
+                        format_func=lambda i, td=all_tbl_displays: td[i],
+                        key=f"out_excl_{oi}",
+                    )
+                    tbl_final_indices = [all_tbl_indices[j] for j in range(len(table_options)) if j not in excluded]
+                elif tbl_mode == 'select':
+                    selected = st.multiselect(
+                        "Odaberi:",
+                        options=range(len(table_options)),
+                        format_func=lambda i, td=all_tbl_displays: td[i],
+                        key=f"out_sel_{oi}",
+                    )
+                    tbl_final_indices = [all_tbl_indices[j] for j in selected]
 
             # ── Spremi output definiciju ──
             out_def = {
                 'type': out_type,
                 'sheet_name': sheet_name[:31],
                 'filter_groups': [g for g in out_filter_groups if g.get('vals')] if use_filt else [],
+                'table_indices': tbl_final_indices,
             }
             if out_type == 'krizanje':
                 out_def['banner_vars'] = [cat_var_names[bi] for bi in banner_vars_sel]
                 out_def['show_sig'] = show_sig
                 out_def['show_sig_total'] = show_sig_total
-                out_def['table_indices'] = tbl_final_indices
-                out_def['table_mode'] = tbl_mode
             output_defs.append(out_def)
 
-    st.button("➕ Dodaj output", on_click=_add_output)
+    bc1, bc2, _ = st.columns([1, 1, 4])
+    with bc1:
+        st.button("➕ Dodaj output", on_click=_add_output)
+    with bc2:
+        st.button("➖ Ukloni output", on_click=_remove_output)
 
     # ── Spremi plan obrade ──
     if output_defs:
@@ -1859,7 +1940,9 @@ def main():
     for od in output_defs:
         filt_str = f" + filter ({len(od['filter_groups'])} uvjeta)" if od['filter_groups'] else ""
         if od['type'] == 'total':
-            out_summary.append(f"**{od['sheet_name']}** — Total{filt_str}")
+            nt = len(od.get('table_indices', []))
+            tbl_str = f" ({nt} tablica)" if nt < len(table_options) else ""
+            out_summary.append(f"**{od['sheet_name']}** — Total{tbl_str}{filt_str}")
         else:
             nb = len(od.get('banner_vars', []))
             nt = len(od.get('table_indices', []))
@@ -1967,9 +2050,12 @@ def main():
 
             if out_def['type'] == 'total':
                 # ── TOTAL output → frekvencijske tablice ──
+                tbl_indices_set = set(out_def.get('table_indices', []))
                 tables, errs = generate_tables(
                     work_df, meta, titles, variables, weight_col, start_num
                 )
+                if tbl_indices_set:
+                    tables = [t for t in tables if t.get('_idx') in tbl_indices_set]
                 total_tables += len(tables)
                 all_errors.extend(errs)
 
