@@ -978,7 +978,7 @@ def main():
         """)
 
         st.divider()
-        st.caption("Hendalice v2.1")
+        st.caption("Hendalice v2.2")
 
     # ── Custom CSS ──
     st.markdown("""
@@ -1018,23 +1018,88 @@ def main():
     #  KORAK 1: Upload fajlova
     # ══════════════════════════════════════════════════
 
+    # ── Widget-key preservation across file swaps ──
+    # Streamlit GC-s widget-backed session_state keys when the widget isn't
+    # rendered.  When the user clears a file uploader to replace it, the
+    # early-return path prevents Korak 2/3 widgets from rendering, losing
+    # all output settings.  We snapshot them before returning early and
+    # restore them once both files are loaded again.
+    _WIDGET_PREFIXES = (
+        'out_type_', 'out_name_', 'out_filt_', 'out_banner_',
+        'out_sig_', 'out_sigtot_', 'out_tblmode_', 'out_excl_', 'out_sel_',
+        'out_name_dirty_', 'out_autoname_',
+        'fg_logic_', 'fg_var_', 'fg_vals_', 'n_fg_',
+    )
+    _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'table_design',
+                       'n_outputs', '_out_order')
+
+    def _snapshot_widget_config():
+        # Don't overwrite an existing snapshot (e.g. saved by _reset_data
+        # before Streamlit GC'd the widget keys on the next rerun)
+        if '_widget_snap' in st.session_state:
+            return
+        snap = {}
+        for k in list(st.session_state.keys()):
+            if k.startswith(_WIDGET_PREFIXES) or k in _WIDGET_GLOBALS:  # type: ignore[union-attr]
+                snap[k] = st.session_state[k]
+        if snap:
+            st.session_state['_widget_snap'] = snap
+
+    def _restore_widget_config():
+        snap = st.session_state.pop('_widget_snap', None)
+        if snap:
+            for k, v in snap.items():
+                if k not in st.session_state:
+                    st.session_state[k] = v
+
     def _reset_data():
-        """Clear loaded data files from session, keep outputs."""
+        """Clear loaded data files from session, keep outputs & plan."""
+        _snapshot_widget_config()
         for k in list(st.session_state.keys()):
             if k.startswith(('df', 'meta', '_sav', 'titles', 'variables',  # type: ignore[union-attr]
-                             'break_vars', '_input', 'var_groups',
-                             '_plan_applied', '_pending_plan')):
+                             'break_vars', '_input', 'var_groups')):
                 del st.session_state[k]
-        # Rotate uploader keys so widgets reset visually
-        st.session_state['_uploader_gen'] = st.session_state.get('_uploader_gen', 0) + 1
+        # Rotate only the data-uploader key (sav + input.txt)
+        st.session_state['_data_ugen'] = st.session_state.get('_data_ugen', 0) + 1
+
+    def _reset_settings():
+        """Clear plan, outputs & settings — keep data files."""
+        n_prev = st.session_state.get('n_outputs', 1)
+        # Remove plan
+        for k in list(st.session_state.keys()):
+            if k.startswith(('_plan_applied', '_pending_plan')):  # type: ignore[union-attr]
+                del st.session_state[k]
+        # Rotate plan uploader key
+        st.session_state['_plan_ugen'] = st.session_state.get('_plan_ugen', 0) + 1
+        # Reset global settings
+        st.session_state['use_weight'] = False
+        st.session_state['add_toc'] = False
+        st.session_state['table_design'] = 'hendal'
+        # Reset outputs
+        st.session_state['n_outputs'] = 1
+        st.session_state['_out_order'] = [0]
+        for oi in range(max(n_prev, 1)):
+            st.session_state[f'out_type_{oi}'] = 'total'
+            st.session_state[f'out_filt_{oi}'] = False
+            st.session_state.pop(f'out_sig_{oi}', None)
+            st.session_state[f'out_sigtot_{oi}'] = False
+            st.session_state[f'out_banner_{oi}'] = []
+            st.session_state[f'out_name_dirty_{oi}'] = False
+            for k in (f'out_name_{oi}', f'out_autoname_{oi}',
+                      f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
+                      f'n_fg_{oi}'):
+                st.session_state.pop(k, None)
+        st.session_state.pop('_widget_snap', None)
 
     def _reset_all():
         """Clear everything — data, outputs, all settings."""
-        gen = st.session_state.get('_uploader_gen', 0) + 1
+        dgen = st.session_state.get('_data_ugen', 0) + 1
+        pgen = st.session_state.get('_plan_ugen', 0) + 1
         n_prev = st.session_state.get('n_outputs', 1)
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.session_state['_uploader_gen'] = gen
+        st.session_state['_data_ugen'] = dgen
+        st.session_state['_plan_ugen'] = pgen
         # Explicitly set widget keys to defaults so Streamlit's internal
         # widget cache is overridden on next render
         st.session_state['use_weight'] = False
@@ -1046,7 +1111,7 @@ def main():
         for oi in range(max(n_prev, 1)):
             st.session_state[f'out_type_{oi}'] = 'total'
             st.session_state[f'out_filt_{oi}'] = False
-            st.session_state[f'out_sig_{oi}'] = False
+            st.session_state.pop(f'out_sig_{oi}', None)
             st.session_state[f'out_sigtot_{oi}'] = False
             st.session_state[f'out_banner_{oi}'] = []
             st.session_state[f'out_name_dirty_{oi}'] = False
@@ -1055,20 +1120,24 @@ def main():
                       f'n_fg_{oi}'):
                 st.session_state.pop(k, None)
 
-    hdr1, _, btn_rd, btn_ra = st.columns([6, 1, 1.2, 1.2])
+    hdr1, _, btn_rd, btn_rs, btn_ra = st.columns([6, 0.5, 1.2, 1.2, 1.2])
     with hdr1:
         st.header("1. Učitajte podatke")
     with btn_rd:
         st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
         st.button("🔄 Reset podataka", key="_btn_reset_data",
-                  on_click=_reset_data, help="Makni učitane fajlove, zadrži outpute")
+                  on_click=_reset_data, help="Makni učitane fajlove, zadrži plan i outpute")
+    with btn_rs:
+        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        st.button("🔄 Reset postavki", key="_btn_reset_settings",
+                  on_click=_reset_settings, help="Makni plan, outpute i postavke, zadrži podatke")
     with btn_ra:
         st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
         st.button("🗑️ Reset svega", key="_btn_reset_all",
                   on_click=_reset_all, help="Makni sve — podatke, outpute, postavke")
 
     col_sav, col_input = st.columns(2)
-    _ugen = st.session_state.get('_uploader_gen', 0)
+    _dugen = st.session_state.get('_data_ugen', 0)
 
     with col_sav:
         st.subheader("📁 SPSS podatkovni fajl (.sav)")
@@ -1076,7 +1145,7 @@ def main():
             "Odaberite .sav fajl",
             type=["sav"],
             help="SPSS podatkovni fajl s vašim podacima",
-            key=f"sav_upload_{_ugen}",
+            key=f"sav_upload_{_dugen}",
         )
 
     with col_input:
@@ -1085,7 +1154,7 @@ def main():
             "Odaberite input.txt",
             type=["txt"],
             help="Tekstualni fajl s definicijama tablica (3 sekcije odvojene praznim redom)",
-            key=f"input_upload_{_ugen}",
+            key=f"input_upload_{_dugen}",
         )
 
     # ── Učitaj .sav ako je uploadano ──
@@ -1135,11 +1204,12 @@ def main():
 
     # ── Plan obrade (opcionalno) ──
     st.subheader("📋 Plan obrade")
+    _pugen = st.session_state.get('_plan_ugen', 0)
     plan_file = st.file_uploader(
         "Učitajte prethodno spremljenu konfiguraciju (_po.json)",
         type=["json"],
         help="Prethodno spremljeni plan obrade sa svim postavkama",
-        key=f"plan_upload_{_ugen}",
+        key=f"plan_upload_{_pugen}",
     )
     if plan_file is not None and df is not None and titles is not None:
         if st.session_state.get('_plan_applied_name') != plan_file.name:
@@ -1151,8 +1221,11 @@ def main():
                 st.error("❌ Neispravan JSON fajl.")
 
     if df is None or titles is None:
+        _snapshot_widget_config()
         st.info("👆 Učitajte oba fajla za nastavak.")
         return
+
+    _restore_widget_config()
 
     # ── Validacija input skripte ──
     break_vars = st.session_state.get('break_vars', [])
@@ -1234,7 +1307,7 @@ def main():
         pond_var = _pond_candidates[0]
         st.info(f"💡 Detektirana ponder varijabla **{pond_var}** u datafileu, ali ponder nije uključen.")
 
-    use_weight = st.checkbox("Koristi ponder", value=False, key="use_weight")
+    use_weight = st.checkbox("Koristi ponder", key="use_weight")
     weight_col = None
     if use_weight:
         # Pre-select pond variable if detected
@@ -1259,7 +1332,7 @@ def main():
     start_num = 1
 
     st.subheader("📑 Table of Contents")
-    add_toc = st.checkbox("Dodaj TOC sheet (BETA)", value=False, key="add_toc",
+    add_toc = st.checkbox("Dodaj TOC sheet (BETA)", key="add_toc",
                           help="Dodaje početni sheet s popisom svih tablica i linkovima")
 
     st.subheader("🎨 Dizajn tablica")
@@ -1525,7 +1598,7 @@ def main():
 
             # ── Filter (per-output) ──
             with st.expander("🔍 Filter", expanded=False):
-                use_filt = st.checkbox("Koristi filter", value=False,
+                use_filt = st.checkbox("Koristi filter",
                                        key=f"out_filt_{oi}")
                 out_filter_groups = []
                 if use_filt and filter_choices:
@@ -1673,11 +1746,12 @@ def main():
                             more = '...' if len(bvals) > 8 else ''
                             st.caption(f"↳ **{bvar}** ({len(bvals)} kat.): {', '.join(cats)}{more}")
 
-                    show_sig = st.checkbox("Značajnost (z-test 95%)", value=True,
+                    st.session_state.setdefault(f'out_sig_{oi}', True)
+                    show_sig = st.checkbox("Značajnost (z-test 95%)",
                                            key=f"out_sig_{oi}",
                                            help="Generira dodatni sheet s _sig sufiksom")
 
-                    show_sig_total = st.checkbox("Sig Total (Total vs kategorije)", value=False,
+                    show_sig_total = st.checkbox("Sig Total (Total vs kategorije)",
                                                 key=f"out_sigtot_{oi}",
                                                 help="Generira dodatni sheet s _sig_total — Total stupac se testira protiv svake kategorije")
 
