@@ -835,7 +835,7 @@ def collect_plan(output_defs, use_weight, weight_col, start_num):
             out['show_sig'] = od.get('show_sig', False)
             out['show_sig_total'] = od.get('show_sig_total', False)
             out['table_indices'] = od.get('table_indices', [])
-            out['table_mode'] = st.session_state.get(f'out_tblmode_{oi}', 'all')
+            out['table_mode'] = od.get('table_mode', 'all')
         plan['outputs'].append(out)
     return plan
 
@@ -844,7 +844,9 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
                         all_tbl_indices, df, val_labels_dict):
     """Set session_state keys for outputs from a loaded plan."""
     outputs = plan.get('outputs', [])
-    st.session_state['n_outputs'] = max(len(outputs), 1)
+    n = max(len(outputs), 1)
+    st.session_state['n_outputs'] = n
+    st.session_state['_out_order'] = list(range(n))
 
     for oi, out in enumerate(outputs):
         st.session_state[f'out_type_{oi}'] = out.get('type', 'total')
@@ -1064,7 +1066,7 @@ def main():
 
     def _reset_settings():
         """Clear plan, outputs & settings — keep data files."""
-        n_prev = st.session_state.get('n_outputs', 1)
+        prev_order = st.session_state.get('_out_order', [0])
         # Remove plan
         for k in list(st.session_state.keys()):
             if k.startswith(('_plan_applied', '_pending_plan')):  # type: ignore[union-attr]
@@ -1076,49 +1078,34 @@ def main():
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
         # Reset outputs
-        st.session_state['n_outputs'] = 1
-        st.session_state['_out_order'] = [0]
-        for oi in range(max(n_prev, 1)):
-            st.session_state[f'out_type_{oi}'] = 'total'
-            st.session_state[f'out_filt_{oi}'] = False
+        for oi in prev_order:
+            st.session_state.pop(f'out_type_{oi}', None)
+            st.session_state.pop(f'out_filt_{oi}', None)
             st.session_state.pop(f'out_sig_{oi}', None)
-            st.session_state[f'out_sigtot_{oi}'] = False
-            st.session_state[f'out_banner_{oi}'] = []
-            st.session_state[f'out_name_dirty_{oi}'] = False
+            st.session_state.pop(f'out_sigtot_{oi}', None)
+            st.session_state.pop(f'out_banner_{oi}', None)
+            st.session_state.pop(f'out_name_dirty_{oi}', None)
             for k in (f'out_name_{oi}', f'out_autoname_{oi}',
                       f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
                       f'n_fg_{oi}'):
                 st.session_state.pop(k, None)
+        st.session_state['n_outputs'] = 1
+        st.session_state['_out_order'] = [0]
         st.session_state.pop('_widget_snap', None)
 
     def _reset_all():
         """Clear everything — data, outputs, all settings."""
         dgen = st.session_state.get('_data_ugen', 0) + 1
         pgen = st.session_state.get('_plan_ugen', 0) + 1
-        n_prev = st.session_state.get('n_outputs', 1)
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.session_state['_data_ugen'] = dgen
         st.session_state['_plan_ugen'] = pgen
-        # Explicitly set widget keys to defaults so Streamlit's internal
-        # widget cache is overridden on next render
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
-        # Reset output widgets for all previously active outputs
-        for oi in range(max(n_prev, 1)):
-            st.session_state[f'out_type_{oi}'] = 'total'
-            st.session_state[f'out_filt_{oi}'] = False
-            st.session_state.pop(f'out_sig_{oi}', None)
-            st.session_state[f'out_sigtot_{oi}'] = False
-            st.session_state[f'out_banner_{oi}'] = []
-            st.session_state[f'out_name_dirty_{oi}'] = False
-            for k in (f'out_name_{oi}', f'out_autoname_{oi}',
-                      f'out_tblmode_{oi}', f'out_excl_{oi}', f'out_sel_{oi}',
-                      f'n_fg_{oi}'):
-                st.session_state.pop(k, None)
 
     hdr1, _, btn_rd, btn_rs, btn_ra = st.columns([6, 0.5, 1.2, 1.2, 1.2])
     with hdr1:
@@ -1411,21 +1398,17 @@ def main():
 
     def _reset_outputs():
         """Reset all outputs back to a single Total."""
-        n = st.session_state.get('n_outputs', 1)
-        for oi in range(n):
+        order = st.session_state.get('_out_order', [0])
+        for oi in order:
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
                             'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
-                k = key_tpl.format(oi)
-                if k in st.session_state:
-                    del st.session_state[k]
+                st.session_state.pop(key_tpl.format(oi), None)
             # Also clean filter group keys
             for fi in range(st.session_state.get(f'n_fg_{oi}', 0) + 1):
                 for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
-                    k = fg_tpl.format(oi, fi)
-                    if k in st.session_state:
-                        del st.session_state[k]
+                    st.session_state.pop(fg_tpl.format(oi, fi), None)
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
 
@@ -1442,30 +1425,29 @@ def main():
         st.session_state['n_outputs'] = 1
 
     def _add_output():
-        n = st.session_state['n_outputs']
+        n = st.session_state.get('n_outputs', 1)
         st.session_state['n_outputs'] = n + 1
-        # Add new item to order
         order = st.session_state.get('_out_order', list(range(n)))
         order.append(n)
         st.session_state['_out_order'] = order
 
-    def _remove_output():
-        n = st.session_state['n_outputs']
-        if n > 1:
-            # Remove the last logical index from order
-            order = st.session_state.get('_out_order', list(range(n)))
-            removed = n - 1
-            order = [x for x in order if x != removed]
-            # Clean session keys for removed output
-            for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
-                            'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
-                            'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
-                k = key_tpl.format(removed)
-                if k in st.session_state:
-                    del st.session_state[k]
-            st.session_state['_out_order'] = order
-            st.session_state['n_outputs'] = n - 1
+    def _delete_output(target):
+        """Remove a specific output by its logical index."""
+        order = st.session_state.get('_out_order', [0])
+        if len(order) <= 1:
+            return
+        order = [x for x in order if x != target]
+        # Clean session keys for deleted output
+        for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
+                        'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                        'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
+                        'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
+            st.session_state.pop(key_tpl.format(target), None)
+        # Clean filter group keys
+        for fi in range(st.session_state.get(f'n_fg_{target}', 0) + 1):
+            for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
+                st.session_state.pop(fg_tpl.format(target, fi), None)
+        st.session_state['_out_order'] = order
 
     def _duplicate_output(src):
         """Copy all session_state keys from output *src* to a new output after src."""
@@ -1504,18 +1486,12 @@ def main():
 
     output_defs = []
 
-    n_out_total = st.session_state['n_outputs']
-
-    # ── Arrow-based reordering ──
+    # ── Order is the source of truth ──
     if '_out_order' not in st.session_state:
-        st.session_state['_out_order'] = list(range(n_out_total))
-    order = st.session_state['_out_order']
-    # Ensure order is consistent with n_outputs
-    existing = set(range(n_out_total))
-    order = [x for x in order if x in existing]
-    for x in existing - set(order):
-        order.append(x)
-    st.session_state['_out_order'] = order
+        st.session_state['_out_order'] = [0]
+        st.session_state['n_outputs'] = 1
+    order = list(st.session_state['_out_order'])  # copy
+    n_out_total = len(order)
 
     def _swap_outputs(pos_a, pos_b):
         """Swap two outputs by their position in the order list."""
@@ -1524,28 +1500,40 @@ def main():
         st.session_state['_out_order'] = o
 
     for pos, oi in enumerate(order):
-        with st.container(border=True):
-            # ── Header: Output N ──
+        # ── Build compact summary for expander label ──
+        _otype = st.session_state.get(f'out_type_{oi}', 'total')
+        _oname = st.session_state.get(f'out_name_{oi}', '')
+        _oicon = '📋' if _otype == 'total' else '📊'
+        _olabel = f"Output {pos + 1}:  {_oicon} {_otype.capitalize()} — {_oname}" if _oname else f"Output {pos + 1}:  {_oicon} {_otype.capitalize()}"
+
+        with st.expander(_olabel, expanded=(n_out_total == 1 or oi == order[-1])):
+            # ── Action buttons row ──
             if n_out_total > 1:
-                up_col, dn_col, h_col, type_col, name_col, reset_col, dup_col = st.columns([0.18, 0.18, 0.7, 2, 2, 0.35, 0.35])
-                with up_col:
+                _c_up, _c_dn, _c_dup, _c_del, _ = st.columns([0.4, 0.4, 0.4, 0.4, 5])
+                with _c_up:
                     st.button("▲", key=f"up_{oi}", disabled=(pos == 0),
                               on_click=_swap_outputs, args=(pos, pos - 1),
                               help="Pomakni gore")
-                with dn_col:
+                with _c_dn:
                     st.button("▼", key=f"dn_{oi}", disabled=(pos == n_out_total - 1),
                               on_click=_swap_outputs, args=(pos, pos + 1),
                               help="Pomakni dolje")
+                with _c_dup:
+                    st.button("📋", key=f"dup_{oi}",
+                              on_click=_duplicate_output, args=(oi,),
+                              help="Dupliciraj")
+                with _c_del:
+                    st.button("🗑️", key=f"del_{oi}",
+                              on_click=_delete_output, args=(oi,),
+                              help="Obriši ovaj output")
             else:
-                h_col, type_col, name_col, reset_col, dup_col = st.columns([0.8, 2, 2, 0.35, 0.35])
+                _c_dup, _ = st.columns([0.4, 5])
+                with _c_dup:
+                    st.button("📋", key=f"dup_{oi}",
+                              on_click=_duplicate_output, args=(oi,),
+                              help="Dupliciraj")
 
-            with h_col:
-                st.markdown(f"### Output {pos + 1}")
-
-            with dup_col:
-                st.button("📋", key=f"dup_{oi}",
-                          on_click=_duplicate_output, args=(oi,),
-                          help="Dupliciraj ovaj output")
+            type_col, name_col, reset_col = st.columns([2, 2, 0.35])
 
             with type_col:
                 out_type = st.selectbox(
@@ -1795,13 +1783,10 @@ def main():
                 out_def['show_sig'] = show_sig
                 out_def['show_sig_total'] = show_sig_total
                 out_def['table_indices'] = tbl_final_indices
+                out_def['table_mode'] = tbl_mode
             output_defs.append(out_def)
 
-    bc1, bc2, _ = st.columns([1, 1, 4])
-    with bc1:
-        st.button("➕ Dodaj output", on_click=_add_output)
-    with bc2:
-        st.button("➖ Ukloni output", on_click=_remove_output)
+    st.button("➕ Dodaj output", on_click=_add_output)
 
     # ── Spremi plan obrade ──
     if output_defs:
