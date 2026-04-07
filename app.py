@@ -819,7 +819,8 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def collect_plan(output_defs, use_weight, weight_col, start_num):
+def collect_plan(output_defs, use_weight, weight_col, start_num,
+                 global_filter_groups=None):
     """Build a JSON-serializable dict from the current configuration."""
     plan = {
         'version': 1,
@@ -828,6 +829,7 @@ def collect_plan(output_defs, use_weight, weight_col, start_num):
             'weight_col': weight_col,
             'start_num': int(start_num),
             'add_toc': bool(st.session_state.get('add_toc', False)),
+            'filter_groups': global_filter_groups or [],
         },
         'outputs': [],
     }
@@ -1036,9 +1038,10 @@ def main():
         'out_sig_', 'out_sigtot_', 'out_tblmode_', 'out_excl_', 'out_sel_',
         'out_name_dirty_', 'out_autoname_',
         'fg_logic_', 'fg_var_', 'fg_vals_', 'n_fg_',
+        'gfg_logic_', 'gfg_var_', 'gfg_vals_',
     )
     _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'table_design',
-                       'n_outputs', '_out_order')
+                       'n_outputs', '_out_order', 'global_filt', 'n_gfg')
 
     def _snapshot_widget_config():
         # Don't overwrite an existing snapshot (e.g. saved by _reset_data
@@ -1069,12 +1072,17 @@ def main():
                 st.session_state.pop(f'fg_var_{_oi}_{_fi}', None)
                 st.session_state.pop(f'fg_vals_{_oi}_{_fi}', None)
         st.session_state.pop('weight_idx', None)
+        # Clear global filter indices
+        for _fi in range(st.session_state.get('n_gfg', 0) + 1):
+            st.session_state.pop(f'gfg_var_{_fi}', None)
+            st.session_state.pop(f'gfg_vals_{_fi}', None)
         # Also clean from snapshot
         snap = st.session_state.get('_widget_snap')
         if snap:
             for _k in list(snap.keys()):
                 if _k.startswith(('out_banner_', 'out_excl_', 'out_sel_',
-                                  'fg_var_', 'fg_vals_')) or _k == 'weight_idx':
+                                  'fg_var_', 'fg_vals_',
+                                  'gfg_var_', 'gfg_vals_')) or _k == 'weight_idx':
                     del snap[_k]
 
     def _reset_data():
@@ -1100,6 +1108,14 @@ def main():
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
+        # Reset global filter
+        st.session_state['global_filt'] = False
+        n_gfg_prev = st.session_state.get('n_gfg', 0)
+        st.session_state.pop('n_gfg', None)
+        for _fi in range(n_gfg_prev + 1):
+            st.session_state.pop(f'gfg_var_{_fi}', None)
+            st.session_state.pop(f'gfg_vals_{_fi}', None)
+            st.session_state.pop(f'gfg_logic_{_fi}', None)
         # Reset outputs
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
@@ -1130,6 +1146,7 @@ def main():
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
+        st.session_state['global_filt'] = False
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
         # Reset output widgets for all previously active outputs
@@ -1325,6 +1342,10 @@ def main():
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
+        # Pre-apply global filter checkbox
+        _gfg_plan = _g.get('filter_groups', [])
+        if _gfg_plan:
+            st.session_state['global_filt'] = True
 
     st.subheader("⚖️ Ponder")
 
@@ -1443,10 +1464,200 @@ def main():
                 })
     choice_displays = [fc['display'] for fc in filter_choices]
 
-    # ── Apply pending plan (output settings) ──
+    # ── Globalni filter ──
+    st.subheader("🔍 Globalni filter")
+    st.caption("Primjenjuje se na **sve** outpute. Kombinira se s per-output filterima koristeći AND.")
+    global_filt = st.checkbox("Koristi globalni filter", key="global_filt")
+    global_filter_groups = []
+    if global_filt and filter_choices:
+        if 'n_gfg' not in st.session_state:
+            st.session_state['n_gfg'] = 1
+
+        def _add_gfg():
+            st.session_state['n_gfg'] += 1
+        def _rm_gfg():
+            if st.session_state['n_gfg'] > 1:
+                st.session_state['n_gfg'] -= 1
+
+        for gfi in range(st.session_state['n_gfg']):
+            if gfi > 0:
+                g_logic = st.radio(
+                    "Veznik", ["I (AND)", "ILI (OR)"],
+                    key=f"gfg_logic_{gfi}",
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+                g_row_logic = 'OR' if 'ILI' in g_logic else 'AND'
+            else:
+                g_row_logic = 'AND'
+
+            gc_var, gc_vals = st.columns([2, 3])
+
+            with gc_var:
+                def _on_gfg_var_change(_fi=gfi):
+                    vals_key = f'gfg_vals_{_fi}'
+                    if vals_key in st.session_state:
+                        st.session_state[vals_key] = []
+
+                g_choice_idx = st.selectbox(
+                    "Pitanje",
+                    options=range(len(filter_choices)),
+                    format_func=lambda i, cd=choice_displays: cd[i],
+                    key=f"gfg_var_{gfi}",
+                    label_visibility="collapsed",
+                    on_change=_on_gfg_var_change,
+                )
+                g_chosen = filter_choices[g_choice_idx]
+
+            with gc_vals:
+                if g_chosen['mode'] == 'multi':
+                    g_sub_vars = g_chosen['vars']
+                    _g_all_vals_set = set()
+                    _g_val_label_map = {}
+                    for sv in g_sub_vars:
+                        for uv in df[sv].dropna().unique():
+                            _g_all_vals_set.add(uv)
+                        svl = val_labels_dict.get(sv, {})
+                        for code, lbl in svl.items():
+                            if lbl:
+                                _g_val_label_map[code] = lbl
+                    try:
+                        _g_all_vals = sorted(
+                            _g_all_vals_set,
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except TypeError:
+                        _g_all_vals = sorted(_g_all_vals_set, key=str)
+
+                    def _g_mr_val_display(uv, vlm=_g_val_label_map):
+                        lbl = vlm.get(uv, '')
+                        if not lbl:
+                            try:
+                                lbl = vlm.get(int(uv) if isinstance(uv, float) and uv == int(uv) else uv, '')
+                            except (ValueError, TypeError):
+                                pass
+                        return f"{uv} — {lbl}" if lbl else str(uv)
+
+                    _g_mr_displays = [_g_mr_val_display(v) for v in _g_all_vals]
+
+                    g_selected = st.multiselect(
+                        "Vrijednosti",
+                        options=range(len(_g_all_vals)),
+                        format_func=lambda i, md=_g_mr_displays: md[i],
+                        key=f"gfg_vals_{gfi}",
+                        label_visibility="collapsed",
+                        placeholder="Odaberite...",
+                    )
+                    g_selected_vals = [_g_all_vals[i] for i in g_selected]
+                    global_filter_groups.append({
+                        'mode': 'multi',
+                        'group_label': g_chosen['display'],
+                        'vars': g_sub_vars,
+                        'vals': g_selected_vals,
+                        'logic': g_row_logic,
+                    })
+                else:
+                    g_the_var = g_chosen['vars'][0]
+                    g_var_vlabels = val_labels_dict.get(g_the_var, {})
+                    try:
+                        g_unique_vals = sorted(
+                            df[g_the_var].dropna().unique(),
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except TypeError:
+                        g_unique_vals = sorted(df[g_the_var].dropna().unique(), key=str)
+
+                    g_val_options = []
+                    for uv in g_unique_vals:
+                        lbl = g_var_vlabels.get(uv, '')
+                        if not lbl:
+                            try:
+                                lbl = g_var_vlabels.get(int(uv) if isinstance(uv, float) and uv == int(uv) else uv, '')
+                            except (ValueError, TypeError):
+                                pass
+                        g_val_options.append(f"{uv} — {lbl}" if lbl else str(uv))
+
+                    g_selected = st.multiselect(
+                        "Vrijednosti",
+                        options=range(len(g_unique_vals)),
+                        format_func=lambda i, vo=g_val_options: vo[i],
+                        key=f"gfg_vals_{gfi}",
+                        label_visibility="collapsed",
+                        placeholder="Odaberite...",
+                    )
+                    g_selected_vals = [g_unique_vals[i] for i in g_selected]
+                    global_filter_groups.append({
+                        'mode': 'single',
+                        'var': g_the_var,
+                        'group_label': g_chosen['display'],
+                        'vals': g_selected_vals,
+                        'logic': g_row_logic,
+                    })
+
+        gbc1, gbc2, _ = st.columns([1, 1, 4])
+        with gbc1:
+            st.button("➕ Uvjet", on_click=_add_gfg, key="gfg_add")
+        with gbc2:
+            st.button("➖ Ukloni", on_click=_rm_gfg, key="gfg_rm")
+
+        active_gfg = [g for g in global_filter_groups if g.get('vals')]
+        if active_gfg:
+            try:
+                gfilt_df = apply_filter_groups(df, active_gfg)
+                st.caption(f"Globalni filter: **{len(gfilt_df)}** od {len(df)} ispitanika")
+            except Exception:
+                pass
+
+    # Spremi aktivne globalne grupe za korištenje u generiranju
+    active_global_filter_groups = [g for g in global_filter_groups if g.get('vals')]
+
+    # ── Apply pending plan (global filter + output settings) ──
     if '_pending_plan' in st.session_state:
+        _pp_data = st.session_state.pop('_pending_plan')
+        # Restore global filter from plan (checkbox already pre-applied above)
+        _gfg = _pp_data.get('global', {}).get('filter_groups', [])
+        if _gfg:
+            st.session_state['n_gfg'] = len(_gfg)
+            for _fi, _fgroup in enumerate(_gfg):
+                if _fi > 0:
+                    _logic_val = "ILI (OR)" if _fgroup.get('logic') == 'OR' else "I (AND)"
+                    st.session_state[f'gfg_logic_{_fi}'] = _logic_val
+                if _fgroup.get('mode') == 'multi':
+                    _saved_vars = set(_fgroup.get('vals', []))
+                    _fc_idx = 0
+                    for _j, _fc in enumerate(filter_choices):
+                        if _fc['mode'] == 'multi' and set(_fc['vars']) == _saved_vars:
+                            _fc_idx = _j
+                            break
+                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
+                    _matched_fc = filter_choices[_fc_idx] if filter_choices else {'vars': []}
+                    _val_idx = [_matched_fc['vars'].index(_v)
+                                for _v in _fgroup['vals'] if _v in _matched_fc['vars']]
+                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
+                else:
+                    _the_var = _fgroup.get('var', '')
+                    _fc_idx = 0
+                    for _j, _fc in enumerate(filter_choices):
+                        if _fc['mode'] == 'single' and _fc['vars'][0] == _the_var:
+                            _fc_idx = _j
+                            break
+                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
+                    try:
+                        _unique_vals = sorted(
+                            df[_the_var].dropna().unique(),
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except (TypeError, KeyError):
+                        _unique_vals = []
+                    _val_idx = []
+                    for _sv in _fgroup.get('vals', []):
+                        for _k, _uv in enumerate(_unique_vals):
+                            if _uv == _sv or str(_uv) == str(_sv):
+                                _val_idx.append(_k)
+                                break
+                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
         _apply_plan_outputs(
-            st.session_state.pop('_pending_plan'),
+            _pp_data,
             cat_var_names, filter_choices, all_tbl_indices,
             df, val_labels_dict,
         )
@@ -1937,7 +2148,8 @@ def main():
 
     # ── Spremi plan obrade ──
     if output_defs:
-        plan_dict = collect_plan(output_defs, use_weight, weight_col, start_num)
+        plan_dict = collect_plan(output_defs, use_weight, weight_col, start_num,
+                                global_filter_groups=active_global_filter_groups)
         plan_json = json.dumps(plan_dict, ensure_ascii=False, indent=2, cls=_NumpyEncoder)
         sav_base = os.path.splitext(st.session_state.get('_sav_name', 'data'))[0]
         plan_filename = f"{sav_base}_po.json"
@@ -2002,6 +2214,9 @@ def main():
                 continue
 
     # Sažetak outputa
+    if active_global_filter_groups:
+        gf_desc = build_filter_groups_description(active_global_filter_groups, labels_dict, val_labels_dict)
+        st.info(f"🔍 **Globalni filter aktivan:** {gf_desc}")
     out_summary = []
     for od in output_defs:
         filt_str = f" + filter ({len(od['filter_groups'])} uvjeta)" if od['filter_groups'] else ""
@@ -2098,8 +2313,10 @@ def main():
             pct_base = int(10 + 80 * out_i / max(n_out, 1))
             progress.progress(pct_base, text=f"Output {out_i + 1}/{n_out}: {out_def['sheet_name']}...")
 
-            # Primijeni per-output filter
+            # Primijeni globalni + per-output filter
             work_df = df.copy()
+            if active_global_filter_groups:
+                work_df = apply_filter_groups(work_df, active_global_filter_groups)
             if out_def['filter_groups']:
                 work_df = apply_filter_groups(work_df, out_def['filter_groups'])
 
