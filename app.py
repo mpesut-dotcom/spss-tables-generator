@@ -985,7 +985,7 @@ def main():
         """)
 
         st.divider()
-        st.caption("Hendalice v2.3")
+        st.caption("Hendalice v2.4")
 
     # ── Custom CSS ──
     st.markdown("""
@@ -1058,6 +1058,24 @@ def main():
             for k, v in snap.items():
                 if k not in st.session_state:
                     st.session_state[k] = v
+
+    def _invalidate_data_indices():
+        """Clear index-based session state keys that depend on data/input file contents."""
+        _n_out = st.session_state.get('n_outputs', 1)
+        for _oi in range(_n_out):
+            for _k in (f'out_banner_{_oi}', f'out_excl_{_oi}', f'out_sel_{_oi}'):
+                st.session_state.pop(_k, None)
+            for _fi in range(st.session_state.get(f'n_fg_{_oi}', 0) + 1):
+                st.session_state.pop(f'fg_var_{_oi}_{_fi}', None)
+                st.session_state.pop(f'fg_vals_{_oi}_{_fi}', None)
+        st.session_state.pop('weight_idx', None)
+        # Also clean from snapshot
+        snap = st.session_state.get('_widget_snap')
+        if snap:
+            for _k in list(snap.keys()):
+                if _k.startswith(('out_banner_', 'out_excl_', 'out_sel_',
+                                  'fg_var_', 'fg_vals_')) or _k == 'weight_idx':
+                    del snap[_k]
 
     def _reset_data():
         """Clear loaded data files from session, keep outputs & plan."""
@@ -1181,6 +1199,7 @@ def main():
                     st.session_state['_sav_hash'] = sav_hash
                 finally:
                     os.unlink(tmp_path)
+            _invalidate_data_indices()
 
         df = st.session_state['df']
         meta = st.session_state['meta']
@@ -1201,6 +1220,7 @@ def main():
             st.session_state['variables'] = variables
             st.session_state['_input_name'] = input_file.name
             st.session_state['_input_hash'] = input_hash
+            _invalidate_data_indices()
 
         titles = st.session_state['titles']
         variables = st.session_state['variables']
@@ -1478,23 +1498,63 @@ def main():
         order.append(n)
         st.session_state['_out_order'] = order
 
-    def _remove_output():
+    def _delete_output(target_oi):
+        """Delete a specific output and compact remaining indices."""
         n = st.session_state['n_outputs']
-        if n > 1:
-            # Remove the last logical index from order
-            order = st.session_state.get('_out_order', list(range(n)))
-            removed = n - 1
-            order = [x for x in order if x != removed]
-            # Clean session keys for removed output
+        if n <= 1:
+            return
+        order = st.session_state.get('_out_order', list(range(n)))
+        if target_oi not in order:
+            return
+        order = [x for x in order if x != target_oi]
+
+        # Build remap: sorted remaining old indices → new contiguous indices
+        remaining_sorted = sorted(set(order))
+        remap = {old: new for new, old in enumerate(remaining_sorted)}
+
+        # Record max n_fg for each output before clearing
+        max_fgs = {oi: st.session_state.get(f'n_fg_{oi}', 0) for oi in range(n)}
+
+        # Collect state for remaining outputs
+        saved = {}
+        for old_idx in remaining_sorted:
+            new_idx = remap[old_idx]
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
                             'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
-                k = key_tpl.format(removed)
+                k = key_tpl.format(old_idx)
                 if k in st.session_state:
-                    del st.session_state[k]
-            st.session_state['_out_order'] = order
-            st.session_state['n_outputs'] = n - 1
+                    saved[key_tpl.format(new_idx)] = st.session_state[k]
+            for fi in range(max_fgs[old_idx] + 1):
+                for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
+                    k = fg_tpl.format(old_idx, fi)
+                    if k in st.session_state:
+                        saved[fg_tpl.format(new_idx, fi)] = st.session_state[k]
+
+        # Clear all output keys
+        for oi in range(n):
+            for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
+                            'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
+                st.session_state.pop(key_tpl.format(oi), None)
+            for fi in range(max_fgs.get(oi, 0) + 1):
+                for fg_tpl in ('fg_logic_{}_{}', 'fg_var_{}_{}', 'fg_vals_{}_{}'):
+                    st.session_state.pop(fg_tpl.format(oi, fi), None)
+
+        # Restore saved state with new indices
+        for k, v in saved.items():
+            st.session_state[k] = v
+
+        st.session_state['_out_order'] = [remap[x] for x in order]
+        st.session_state['n_outputs'] = n - 1
+
+    def _remove_output():
+        n = st.session_state['n_outputs']
+        if n > 1:
+            order = st.session_state.get('_out_order', list(range(n)))
+            _delete_output(order[-1])
 
     def _duplicate_output(src):
         """Copy all session_state keys from output *src* to a new output after src."""
@@ -1556,7 +1616,7 @@ def main():
         with st.container(border=True):
             # ── Header: Output N ──
             if n_out_total > 1:
-                up_col, dn_col, h_col, type_col, name_col, reset_col, dup_col = st.columns([0.18, 0.18, 0.7, 2, 2, 0.35, 0.35])
+                up_col, dn_col, h_col, type_col, name_col, reset_col, dup_col, del_col = st.columns([0.18, 0.18, 0.7, 2, 2, 0.35, 0.35, 0.35])
                 with up_col:
                     st.button("▲", key=f"up_{oi}", disabled=(pos == 0),
                               on_click=_swap_outputs, args=(pos, pos - 1),
@@ -1575,6 +1635,12 @@ def main():
                 st.button("📋", key=f"dup_{oi}",
                           on_click=_duplicate_output, args=(oi,),
                           help="Dupliciraj ovaj output")
+
+            if n_out_total > 1:
+                with del_col:
+                    st.button("🗑️", key=f"del_{oi}",
+                              on_click=_delete_output, args=(oi,),
+                              help="Obriši ovaj output")
 
             with type_col:
                 out_type = st.selectbox(
