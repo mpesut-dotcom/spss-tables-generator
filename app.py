@@ -1342,10 +1342,6 @@ def main():
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
-        # Pre-apply global filter checkbox
-        _gfg_plan = _g.get('filter_groups', [])
-        if _gfg_plan:
-            st.session_state['global_filt'] = True
 
     st.subheader("⚖️ Ponder")
 
@@ -1463,6 +1459,60 @@ def main():
                     'vars': [v],
                 })
     choice_displays = [fc['display'] for fc in filter_choices]
+
+    # ── Apply pending plan (global filter + output settings) ──
+    # Must run BEFORE global filter UI to avoid modifying instantiated widgets
+    if '_pending_plan' in st.session_state:
+        _pp_data = st.session_state.pop('_pending_plan')
+        # Restore global filter from plan
+        _gfg = _pp_data.get('global', {}).get('filter_groups', [])
+        st.session_state['global_filt'] = bool(_gfg)
+        if _gfg:
+            st.session_state['n_gfg'] = len(_gfg)
+            for _fi, _fgroup in enumerate(_gfg):
+                if _fi > 0:
+                    _logic_val = "ILI (OR)" if _fgroup.get('logic') == 'OR' else "I (AND)"
+                    st.session_state[f'gfg_logic_{_fi}'] = _logic_val
+                if _fgroup.get('mode') == 'multi':
+                    _saved_vars = set(_fgroup.get('vals', []))
+                    _fc_idx = 0
+                    for _j, _fc in enumerate(filter_choices):
+                        if _fc['mode'] == 'multi' and set(_fc['vars']) == _saved_vars:
+                            _fc_idx = _j
+                            break
+                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
+                    _matched_fc = filter_choices[_fc_idx] if filter_choices else {'vars': []}
+                    _val_idx = [_matched_fc['vars'].index(_v)
+                                for _v in _fgroup['vals'] if _v in _matched_fc['vars']]
+                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
+                else:
+                    _the_var = _fgroup.get('var', '')
+                    _fc_idx = 0
+                    for _j, _fc in enumerate(filter_choices):
+                        if _fc['mode'] == 'single' and _fc['vars'][0] == _the_var:
+                            _fc_idx = _j
+                            break
+                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
+                    try:
+                        _unique_vals = sorted(
+                            df[_the_var].dropna().unique(),
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except (TypeError, KeyError):
+                        _unique_vals = []
+                    _val_idx = []
+                    for _sv in _fgroup.get('vals', []):
+                        for _k, _uv in enumerate(_unique_vals):
+                            if _uv == _sv or str(_uv) == str(_sv):
+                                _val_idx.append(_k)
+                                break
+                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
+        _apply_plan_outputs(
+            _pp_data,
+            cat_var_names, filter_choices, all_tbl_indices,
+            df, val_labels_dict,
+        )
+        st.rerun()
 
     # ── Globalni filter ──
     st.subheader("🔍 Globalni filter")
@@ -1610,58 +1660,6 @@ def main():
 
     # Spremi aktivne globalne grupe za korištenje u generiranju
     active_global_filter_groups = [g for g in global_filter_groups if g.get('vals')]
-
-    # ── Apply pending plan (global filter + output settings) ──
-    if '_pending_plan' in st.session_state:
-        _pp_data = st.session_state.pop('_pending_plan')
-        # Restore global filter from plan (checkbox already pre-applied above)
-        _gfg = _pp_data.get('global', {}).get('filter_groups', [])
-        if _gfg:
-            st.session_state['n_gfg'] = len(_gfg)
-            for _fi, _fgroup in enumerate(_gfg):
-                if _fi > 0:
-                    _logic_val = "ILI (OR)" if _fgroup.get('logic') == 'OR' else "I (AND)"
-                    st.session_state[f'gfg_logic_{_fi}'] = _logic_val
-                if _fgroup.get('mode') == 'multi':
-                    _saved_vars = set(_fgroup.get('vals', []))
-                    _fc_idx = 0
-                    for _j, _fc in enumerate(filter_choices):
-                        if _fc['mode'] == 'multi' and set(_fc['vars']) == _saved_vars:
-                            _fc_idx = _j
-                            break
-                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
-                    _matched_fc = filter_choices[_fc_idx] if filter_choices else {'vars': []}
-                    _val_idx = [_matched_fc['vars'].index(_v)
-                                for _v in _fgroup['vals'] if _v in _matched_fc['vars']]
-                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
-                else:
-                    _the_var = _fgroup.get('var', '')
-                    _fc_idx = 0
-                    for _j, _fc in enumerate(filter_choices):
-                        if _fc['mode'] == 'single' and _fc['vars'][0] == _the_var:
-                            _fc_idx = _j
-                            break
-                    st.session_state[f'gfg_var_{_fi}'] = _fc_idx
-                    try:
-                        _unique_vals = sorted(
-                            df[_the_var].dropna().unique(),
-                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
-                        )
-                    except (TypeError, KeyError):
-                        _unique_vals = []
-                    _val_idx = []
-                    for _sv in _fgroup.get('vals', []):
-                        for _k, _uv in enumerate(_unique_vals):
-                            if _uv == _sv or str(_uv) == str(_sv):
-                                _val_idx.append(_k)
-                                break
-                    st.session_state[f'gfg_vals_{_fi}'] = _val_idx
-        _apply_plan_outputs(
-            _pp_data,
-            cat_var_names, filter_choices, all_tbl_indices,
-            df, val_labels_dict,
-        )
-        st.rerun()
 
     st.divider()
 
