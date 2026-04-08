@@ -173,8 +173,9 @@ def _deduplicate_blocks(blocks):
 def _build_filter_map(filters, ctables_blocks, raw_data):
     """
     Map filter expressions to the CTABLES block they precede.
-    In SPO binary, filter value appears right before its CTABLES syntax.
-    If only 1 unique filter → it applies to ALL tables (global).
+    In SPO binary, each CTABLES block appears twice (Notes + NavNote).
+    Filter expressions appear before their CTABLES blocks.
+    Multiple filters before the same block are combined with ' AND '.
     """
     if not filters:
         return {}
@@ -184,33 +185,58 @@ def _build_filter_map(filters, ctables_blocks, raw_data):
         # Single filter → global, applies to all tables
         return {i: unique_filters[0] for i in range(len(ctables_blocks))}
 
-    # Multiple unique filters — try to pair by position in binary data
+    n_f = len(unique_filters)
+    n_b = len(ctables_blocks)
+
+    # When filters come in pairs (e.g. q8_X + q17_X for each table),
+    # pair them sequentially: filters[0]+[1]→block 0, [2]+[3]→block 1, etc.
+    if n_f == 2 * n_b:
+        fmap = {}
+        for i in range(n_b):
+            f1 = unique_filters[2 * i]
+            f2 = unique_filters[2 * i + 1]
+            fmap[i] = f'{f1} AND {f2}'
+        return fmap
+
+    # 1:1 mapping
+    if n_f == n_b:
+        return {i: unique_filters[i] for i in range(n_b)}
+
+    # Fallback: position-based mapping
     text = raw_data.decode('latin-1', errors='replace')
+
     filter_positions = []
     for filt in unique_filters:
-        pos = text.find(filt)
-        if pos >= 0:
+        start = 0
+        while True:
+            pos = text.find(filt, start)
+            if pos < 0:
+                break
             filter_positions.append((pos, filt))
+            start = pos + len(filt)
     filter_positions.sort()
 
     ctables_positions = []
     for i, block in enumerate(ctables_blocks):
-        pos = text.find(block[:60])
+        search_str = block[:200]
+        pos = text.find(search_str)
         if pos >= 0:
             ctables_positions.append((pos, i))
     ctables_positions.sort()
 
-    # Map: for each CTABLES block, find the closest preceding filter
+    if not ctables_positions:
+        return {i: unique_filters[0] for i in range(n_b)}
+
     fmap = {}
-    for ct_pos, ct_idx in ctables_positions:
-        best = None
+    for idx, (ct_pos, ct_idx) in enumerate(ctables_positions):
+        prev_ct_pos = ctables_positions[idx - 1][0] if idx > 0 else 0
+        preceding = []
         for f_pos, f_expr in filter_positions:
-            if f_pos < ct_pos:
-                best = f_expr
-            else:
-                break
-        if best:
-            fmap[ct_idx] = best
+            if f_pos >= prev_ct_pos and f_pos < ct_pos:
+                if f_expr not in preceding:
+                    preceding.append(f_expr)
+        if preceding:
+            fmap[ct_idx] = ' AND '.join(preceding)
     return fmap
 
 
@@ -375,26 +401,30 @@ def parse_filter_expression(expr):
         'q32=1'                         → [{'var': 'q32', 'vals': [1.0]}]
         'q12_3=1 or q12_3=2 or q12_3=3' → [{'var': 'q12_3', 'vals': [1.0, 2.0, 3.0]}]
         'q8_9=9'                        → [{'var': 'q8_9', 'vals': [9.0]}]
+        'q8_9=9 AND q17_9=9'           → [{'var': 'q8_9', 'vals': [9.0]}, {'var': 'q17_9', 'vals': [9.0]}]
 
     Returns list of dicts with 'var' and 'vals' keys.
     """
     if not expr:
         return []
 
-    # Split on 'or' (case-insensitive)
-    parts = re.split(r'\bor\b', expr, flags=re.IGNORECASE)
+    # Split on ' AND ' first (combined filters from _build_filter_map)
+    and_parts = re.split(r'\s+AND\s+', expr)
 
-    # Group by variable
     conditions = {}
-    for part in parts:
-        part = part.strip()
-        m = re.match(r'(\w+)\s*=\s*([0-9.]+)', part)
-        if m:
-            var = m.group(1)
-            val = float(m.group(2))
-            if val == int(val):
-                val = int(val)
-            conditions.setdefault(var, []).append(val)
+    for and_part in and_parts:
+        # Split each part on 'or' (case-insensitive)
+        parts = re.split(r'\bor\b', and_part, flags=re.IGNORECASE)
+
+        for part in parts:
+            part = part.strip()
+            m = re.match(r'(\w+)\s*=\s*([0-9.]+)', part)
+            if m:
+                var = m.group(1)
+                val = float(m.group(2))
+                if val == int(val):
+                    val = int(val)
+                conditions.setdefault(var, []).append(val)
 
     return [{'var': var, 'vals': vals} for var, vals in conditions.items()]
 

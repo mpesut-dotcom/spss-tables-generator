@@ -2,6 +2,9 @@
 stare skripte/
 primjeri/
 
+# Tests
+tests/
+
 # Python
 __pycache__/
 *.pyc

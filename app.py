@@ -33,6 +33,7 @@ from spss_tables import (
     compute_sig_total_banner,
     get_table_title,
     get_table_type,
+    get_var_label,
     make_crosstab_mr,
     make_crosstab_numeric,
     make_crosstab_simple,
@@ -850,22 +851,26 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
     return plan
 
 
-def _build_synthetic_entry(tbl, col_lc):
+def _build_synthetic_entry(tbl, col_lc, meta=None):
     """
     Create a synthetic (title, variable) pair for an SPO table whose
     variables exist in the dataset but not in input.txt.
+    Uses SPSS variable labels from meta when available.
     """
     if tbl['is_mr']:
         resolved = [col_lc[v.lower()] for v in tbl['mr_vars'] if v.lower() in col_lc]
         if not resolved:
             return None
-        title = f"k [SPO] MR: {resolved[0].split('_')[0]}"
+        group_name = resolved[0].split('_')[0]
+        lbl = get_var_label(resolved[0], meta) if meta else resolved[0]
+        title = f"k {lbl}" if lbl != resolved[0] else f"k [SPO] MR: {group_name}"
         var_line = "$e1 '' " + ' '.join(resolved)
     elif tbl['is_numeric']:
         resolved = [col_lc[v.lower()] for v in tbl['row_vars'] if v.lower() in col_lc]
         if not resolved:
             return None
-        title = f"n [SPO] {resolved[0]}"
+        lbl = get_var_label(resolved[0], meta) if meta else resolved[0]
+        title = f"n {lbl}" if lbl != resolved[0] else f"n [SPO] {resolved[0]}"
         left = ' '.join(resolved)
         right = '+'.join(resolved)
         # parse_numeric_vars splits at len//2 — pad left so midpoint
@@ -877,13 +882,14 @@ def _build_synthetic_entry(tbl, col_lc):
         resolved = [col_lc[v.lower()] for v in tbl['row_vars'] if v.lower() in col_lc]
         if not resolved:
             return None
-        title = f"s [SPO] {resolved[0]}"
+        lbl = get_var_label(resolved[0], meta) if meta else resolved[0]
+        title = f"s {lbl}" if lbl != resolved[0] else f"s [SPO] {resolved[0]}"
         var_line = resolved[0]
     return title, var_line
 
 
 def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
-                         all_tbl_indices, loaded_sav_name):
+                         all_tbl_indices, loaded_sav_name, meta=None):
     """
     Convert multiple SPO parse results into a plan dict compatible
     with _apply_plan_outputs().
@@ -938,6 +944,7 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
         # ── Match tables to input.txt ──
         matches = match_spo_to_input(spo, titles, variables, df.columns)
         n_ok = 0
+        _seen_outputs = set()
 
         for mi in matches:
             tbl = mi['spo_table']
@@ -948,7 +955,7 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             if mi['match_status'] == 'df_only':
                 if tbl['is_mr']:
                     # One synthetic MR entry for the whole group
-                    entry = _build_synthetic_entry(tbl, col_lc)
+                    entry = _build_synthetic_entry(tbl, col_lc, meta)
                     if entry:
                         new_idx = len(titles)
                         titles.append(entry[0])
@@ -965,7 +972,7 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                         continue
                 elif tbl['is_numeric']:
                     # One synthetic numeric entry
-                    entry = _build_synthetic_entry(tbl, col_lc)
+                    entry = _build_synthetic_entry(tbl, col_lc, meta)
                     if entry:
                         new_idx = len(titles)
                         titles.append(entry[0])
@@ -981,7 +988,8 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                         resolved = col_lc.get(rv.lower())
                         if resolved:
                             new_idx = len(titles)
-                            title = f"s [SPO] {resolved}"
+                            lbl = get_var_label(resolved, meta) if meta else resolved
+                            title = f"s {lbl}" if lbl != resolved else f"s [SPO] {resolved}"
                             titles.append(title)
                             variables.append(resolved)
                             synthetic_entries.append((title, resolved))
@@ -1035,27 +1043,25 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                 bvar = col_lc.get(tbl['banner_var'].lower())
                 if bvar and bvar in cat_var_names:
                     out['banner_vars'] = [bvar]
-                    out['show_sig'] = True
+                    out['show_sig'] = False
                     out['show_sig_total'] = False
                 else:
                     # Banner var not categorical — fall back to total
                     out['type'] = 'total'
 
-            # ── Sheet name ──
-            base = 'TOTAL' if out['type'] == 'total' else 'CROSS'
-            if out.get('banner_vars'):
-                base = 'CROSS_' + '_'.join(out['banner_vars'])
-            if out['filter_groups']:
-                fg0 = out['filter_groups'][0]
-                if fg0.get('mode') == 'multi':
-                    # Use first var of the MR group for naming
-                    fvar = fg0.get('vars', [''])[0]
-                else:
-                    fvar = fg0.get('var', '')
-                fvals = fg0.get('vals', [])
-                fstr = f"{fvar}={'_'.join(str(int(v)) for v in fvals)}"
-                base = f"{base}_{fstr}"
-            out['sheet_name'] = base[:31]
+            # ── Sheet name (based on SPO filename) ──
+            import re as _re_sn
+            spo_base = _re_sn.sub(r'_v\d+$', '', os.path.splitext(fname)[0])
+            out['sheet_name'] = spo_base[:31]
+
+            # Deduplicate: skip if an output with the same content already exists
+            _content_parts = []
+            for _di in out['table_indices']:
+                _content_parts.append((titles[_di], variables[_di]))
+            dedup_key = (tuple(_content_parts), out['sheet_name'], out['type'])
+            if dedup_key in _seen_outputs:
+                continue
+            _seen_outputs.add(dedup_key)
 
             all_outputs.append(out)
             n_ok += 1
@@ -1588,6 +1594,7 @@ def main():
                 [i for i, t in enumerate(titles)
                  if get_table_type(t) in ('s', 'k', 'd', 'n', 'm')],
                 loaded_sav_name,
+                meta=meta,
             )
 
             # Append synthetic input entries to session_state
@@ -2767,6 +2774,11 @@ def main():
 
                 col_map = build_column_map(work_df)
 
+                # Build per-group banner labels (question label for each crossing variable)
+                _banner_labels = None
+                if meta and banner_vars:
+                    _banner_labels = [get_var_label(_bv, meta) for _bv in banner_vars]
+
                 # Sheet bez sig-a (uvijek)
                 ws_name = _unique_name(out_def['sheet_name'])
                 ws = wb.create_sheet(title=ws_name)
@@ -2774,13 +2786,15 @@ def main():
                 # Sheet sa sig-om (ako show_sig=True)
                 ws_sig = None
                 if show_sig:
-                    sig_name = _unique_name(out_def['sheet_name'] + '_sig')
+                    _sig_base = out_def['sheet_name'][:27] + '_sig'
+                    sig_name = _unique_name(_sig_base)
                     ws_sig = wb.create_sheet(title=sig_name)
 
                 # Sheet sa sig_total (ako show_sig_total=True)
                 ws_sig_total = None
                 if show_sig_total:
-                    sig_total_name = _unique_name(out_def['sheet_name'] + '_sig_total')
+                    _sigt_base = out_def['sheet_name'][:21] + '_sig_total'
+                    sig_total_name = _unique_name(_sigt_base)
                     ws_sig_total = wb.create_sheet(title=sig_total_name)
 
                 current_row = 1
@@ -2854,7 +2868,8 @@ def main():
                     current_row = write_banner_to_sheet(
                         ws, banner, title_str,
                         start_row=current_row, show_sig=False,
-                        design=table_design)
+                        design=table_design,
+                        banner_labels=_banner_labels)
                     current_row += 2
 
                     # Write to sig sheet (with sig)
@@ -2862,7 +2877,8 @@ def main():
                         current_row_sig = write_banner_to_sheet(
                             ws_sig, banner, title_str,
                             start_row=current_row_sig, show_sig=True,
-                            design=table_design)
+                            design=table_design,
+                            banner_labels=_banner_labels)
                         current_row_sig += 2
 
                     # Write to sig_total sheet (sig on Total column)
@@ -2870,7 +2886,8 @@ def main():
                         current_row_st = write_banner_to_sheet(
                             ws_sig_total, banner, title_str,
                             start_row=current_row_st, show_sig=True,
-                            show_sig_total=True, design=table_design)
+                            show_sig_total=True, design=table_design,
+                            banner_labels=_banner_labels)
                         current_row_st += 2
 
         # ── TOC sheet (question-centric) ──

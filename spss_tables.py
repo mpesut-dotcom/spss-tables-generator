@@ -685,24 +685,39 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
     subset = df[valid_mask].copy()
     use_weight = weight_col and weight_col in subset.columns
 
+    # break_vals: use subset to determine break categories (only where MR data exists)
     break_vals = sorted(subset[actual_break].dropna().unique(),
                         key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)))
 
     col_labels = [label_for_value(bv, break_labels) for bv in break_vals] + ['Total']
     col_letters = SIG_LETTERS[:len(break_vals)]
 
-    # N za svaki stupac (cases, ne responses)
+    # N row: full base (all respondents with valid banner), matching SPSS CTABLES
+    base = df[df[actual_break].notna()]
     col_ns = []
     for bv in break_vals:
-        mask = subset[actual_break] == bv
+        mask = base[actual_break] == bv
         if use_weight:
-            col_ns.append(float(subset.loc[mask, weight_col].sum()))
+            col_ns.append(float(base.loc[mask, weight_col].sum()))
         else:
             col_ns.append(int(mask.sum()))
     if use_weight:
-        col_ns.append(float(subset[weight_col].sum()))
+        col_ns.append(float(base[weight_col].sum()))
     else:
-        col_ns.append(len(subset))
+        col_ns.append(len(base))
+
+    # Percentage denominators: MR-valid respondents per column (subset of base)
+    pct_denoms = []
+    for bv in break_vals:
+        mask = subset[actual_break] == bv
+        if use_weight:
+            pct_denoms.append(float(subset.loc[mask, weight_col].sum()))
+        else:
+            pct_denoms.append(int(mask.sum()))
+    if use_weight:
+        pct_denoms.append(float(subset[weight_col].sum()))
+    else:
+        pct_denoms.append(len(subset))
 
     if mr_type == 'k':
         # MRGROUP: rows = unique values across all variables
@@ -728,14 +743,14 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
+                pct = round(n / pct_denoms[ci] * 100, 5) if pct_denoms[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
+            pct_total = round(n_total / pct_denoms[-1] * 100, 5) if pct_denoms[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
     else:
@@ -751,18 +766,18 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
+                pct = round(n / pct_denoms[ci] * 100, 5) if pct_denoms[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
+            pct_total = round(n_total / pct_denoms[-1] * 100, 5) if pct_denoms[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
 
-    sig_matrix = _compute_sig_pct(pct_matrix, col_ns, col_letters, len(break_vals))
+    sig_matrix = _compute_sig_pct(pct_matrix, pct_denoms, col_letters, len(break_vals))
 
     return {
         'type': 'mr',
@@ -1128,11 +1143,14 @@ def compute_sig_total_banner(banner):
 
 
 def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
-                          show_sig_total=False, design='hendal'):
+                          show_sig_total=False, design='hendal',
+                          banner_labels=None):
     """
     Write a merged banner crosstab to an Excel sheet.
     All banner groups side by side, with visual separation, one Total column.
     show_sig_total: if True, Total column gets sig letters vs each category.
+    banner_labels: list of question labels, one per banner group.
+        Rendered as a merged header row above the column labels.
     Returns the next free row number.
     """
     t = _get_theme(design)
@@ -1175,6 +1193,32 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
     ws.merge_cells(start_row=row_num, start_column=1,
                    end_row=row_num, end_column=n_total_cols)
     row_num += 1
+
+    # ── Banner group label row (merged header per group, matching fill) ──
+    if banner_labels and len(banner_labels) >= len(groups):
+        _grp_label_font = Font(name=_fn, size=10, bold=True, color=_banner_hdr_color)
+        ws.cell(row=row_num, column=1, value='').border = header_border
+        ws.cell(row=row_num, column=2, value='').border = header_border
+        ws.cell(row=row_num, column=2).fill = total_fill
+        col_off = 3
+        for gi, grp in enumerate(groups):
+            fill = _active_banner_fills[gi % len(_active_banner_fills)]
+            n_grp_cols = len(grp['col_labels'])
+            cell = ws.cell(row=row_num, column=col_off, value=banner_labels[gi])
+            cell.font = _grp_label_font
+            cell.fill = fill
+            cell.border = Border(left=_sep, bottom=_strong)
+            cell.alignment = Alignment(horizontal='center')
+            if n_grp_cols > 1:
+                ws.merge_cells(start_row=row_num, start_column=col_off,
+                               end_row=row_num, end_column=col_off + n_grp_cols - 1)
+                # Apply fill + border to all merged cells
+                for _ci in range(1, n_grp_cols):
+                    _c = ws.cell(row=row_num, column=col_off + _ci)
+                    _c.fill = fill
+                    _c.border = header_border
+            col_off += n_grp_cols
+        row_num += 1
 
     # ── Header row: Total first, then category labels ──
     ws.cell(row=row_num, column=1, value='').border = header_border
