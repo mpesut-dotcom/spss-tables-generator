@@ -100,7 +100,7 @@ def parse_spo(filepath):
     # ── FREQUENCIES syntax blocks ──
     freq_blocks = []
     for run in runs:
-        m = re.search(r'FREQUENCIES\s+VARIABLES=([\w\s]+)', run, re.IGNORECASE)
+        m = re.search(r'FREQUENCIES\s+VARIABLES\s*=\s*([\w.\s]+)', run, re.IGNORECASE)
         if m:
             freq_blocks.append(run)
 
@@ -316,10 +316,11 @@ def _parse_crosstabs_syntax(syntax):
 
 
 def _parse_frequencies_syntax(syntax):
-    """Parse FREQUENCIES VARIABLES=var1 var2 ..."""
-    m = re.search(r'FREQUENCIES\s+VARIABLES=([\w\s]+?)(?:\s*/|\s*\.)', syntax, re.IGNORECASE)
+    """Parse FREQUENCIES VARIABLES=var1 var2 ... (vars may contain dots, separated by spaces or \\r)."""
+    m = re.search(r'FREQUENCIES\s+VARIABLES\s*=\s*([\w.\s]+)', syntax, re.IGNORECASE)
     if m:
-        var_list = m.group(1).strip().split()
+        raw = m.group(1).strip().rstrip('.')
+        var_list = [v.rstrip('.') for v in re.split(r'\s+', raw) if v.rstrip('.')]
         return {
             'type': 'total',
             'row_vars': var_list,
