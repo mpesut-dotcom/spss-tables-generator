@@ -563,6 +563,62 @@ def validate_datafile(df, meta, input_vars=None):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  FORCE ALL VARIABLES — auto-generate titles/variables for .sav columns
+# ═══════════════════════════════════════════════════════════════════
+
+def _generate_extra_entries(df, meta, existing_titles, existing_variables):
+    """
+    Za sve varijable iz df koje NISU definirane u existing input skripti,
+    generiraj title/variable parove koristeći SPSS metapodatke.
+
+    Kategoričke (imaju value labels ili ≤30 unique) → tip 's'
+    Numeričke (continuous) → tip 'n'
+
+    Returns: (extra_titles, extra_variables) — lists to append.
+    """
+    labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
+    val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
+
+    # Collect all vars already defined in input script
+    existing_vars = set()
+    col_set_lc = {c.lower(): c for c in df.columns}
+    for var_line in existing_variables:
+        for v in _extract_vars_from_line(var_line):
+            resolved = col_set_lc.get(v.lower())
+            if resolved:
+                existing_vars.add(resolved)
+
+    extra_titles = []
+    extra_variables = []
+
+    for col in df.columns:
+        if col in existing_vars:
+            continue
+
+        var_label = labels_dict.get(col, '')
+        display_name = var_label if var_label and var_label != col else col
+        has_val_labels = bool(val_labels_dict.get(col))
+        nunique = df[col].dropna().nunique()
+        is_numeric = pd.api.types.is_numeric_dtype(df[col])
+
+        if has_val_labels or (nunique <= 30 and nunique >= 1):
+            # Categorical → simple frequency table
+            extra_titles.append(f"s {display_name}:")
+            extra_variables.append(col)
+        elif is_numeric and nunique > 0:
+            # Numeric → mean table (type 'n')
+            # Format: left half = var name, right half = var+expression
+            # Pad so midpoint split works: "var  var"
+            pad = max(len(col), 1)
+            var_line = col.ljust(pad + 1) + col
+            extra_titles.append(f"n {display_name} - MEAN")
+            extra_variables.append(var_line)
+        # Skip columns with 0 unique values (all NaN)
+
+    return extra_titles, extra_variables
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  GRUPIRANJE VARIJABLI IZ INPUT DEFINICIJA
 # ═══════════════════════════════════════════════════════════════════
 
@@ -829,6 +885,7 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             'weight_col': weight_col,
             'start_num': int(start_num),
             'add_toc': bool(st.session_state.get('add_toc', False)),
+            'force_all_vars': bool(st.session_state.get('force_all_vars', False)),
             'filter_groups': global_filter_groups or [],
         },
         'outputs': [],
@@ -1046,7 +1103,8 @@ def main():
         'gfg_logic_', 'gfg_var_', 'gfg_vals_',
     )
     _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'table_design',
-                       'n_outputs', '_out_order', 'global_filt', 'n_gfg')
+                       'n_outputs', '_out_order', 'global_filt', 'n_gfg',
+                       'force_all_vars')
 
     def _snapshot_widget_config():
         # Don't overwrite an existing snapshot (e.g. saved by _reset_data
@@ -1119,6 +1177,7 @@ def main():
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
+        st.session_state['force_all_vars'] = False
         # Reset global filter
         st.session_state['global_filt'] = False
         n_gfg_prev = st.session_state.get('n_gfg', 0)
@@ -1350,6 +1409,7 @@ def main():
         _g = _pp.get('global', {})
         st.session_state['use_weight'] = _g.get('use_weight', False)
         st.session_state['add_toc'] = _g.get('add_toc', False)
+        st.session_state['force_all_vars'] = _g.get('force_all_vars', False)
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
@@ -1397,6 +1457,23 @@ def main():
         format_func=lambda x: {'hendal': '🟡 Hendal', 'mate': '🐉 Mate'}[x],
         key="table_design",
     )
+
+    st.subheader("📊 Force all variables")
+    force_all_vars = st.checkbox(
+        "Koristi sve varijable iz datafile-a",
+        key="force_all_vars",
+        help="Automatski dodaje tablice za sve varijable iz .sav fajla "
+             "koje nisu definirane u input skripti. "
+             "Kategoričke → frekvencije (s), numeričke → mean (n).",
+    )
+    if force_all_vars:
+        _extra_titles, _extra_variables = _generate_extra_entries(
+            df, meta, titles, variables)  # type: ignore[arg-type]
+        if _extra_titles:
+            titles = list(titles) + _extra_titles  # type: ignore[arg-type]
+            variables = list(variables) + _extra_variables  # type: ignore[arg-type]
+            st.caption(f"Dodano **{len(_extra_titles)}** tablica iz datafile-a "
+                       f"(ukupno {len(titles)})")
 
     # ── Priprema za filtre i krizanja ──
     var_groups = build_variable_groups(titles, variables, df.columns)
