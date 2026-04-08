@@ -494,7 +494,8 @@ def match_spo_to_input(spo_result, titles, variables, df_columns):
             match_info['match_status'] = 'ok'
             match_info['reason'] = f'Pronađeno {len(matched)} tablica'
         else:
-            match_info['reason'] = f'Varijable iz SPO ({", ".join(sorted(search_vars)[:5])}) nisu pronađene u input.txt tablicama'
+            match_info['match_status'] = 'df_only'
+            match_info['reason'] = f'Varijable postoje u datasetu ali ne u input.txt — bit će dodane automatski'
 
         results.append(match_info)
 

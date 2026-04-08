@@ -850,18 +850,55 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
     return plan
 
 
+def _build_synthetic_entry(tbl, col_lc):
+    """
+    Create a synthetic (title, variable) pair for an SPO table whose
+    variables exist in the dataset but not in input.txt.
+    """
+    if tbl['is_mr']:
+        resolved = [col_lc[v.lower()] for v in tbl['mr_vars'] if v.lower() in col_lc]
+        if not resolved:
+            return None
+        title = f"k [SPO] MR: {resolved[0].split('_')[0]}"
+        var_line = "$e1 '' " + ' '.join(resolved)
+    elif tbl['is_numeric']:
+        resolved = [col_lc[v.lower()] for v in tbl['row_vars'] if v.lower() in col_lc]
+        if not resolved:
+            return None
+        title = f"n [SPO] {resolved[0]}"
+        left = ' '.join(resolved)
+        right = '+'.join(resolved)
+        # parse_numeric_vars splits at len//2 — pad left so midpoint
+        # falls on the space between left and right halves
+        target_len = len(right)
+        left_padded = left.ljust(target_len)
+        var_line = left_padded + ' ' + right
+    else:
+        resolved = [col_lc[v.lower()] for v in tbl['row_vars'] if v.lower() in col_lc]
+        if not resolved:
+            return None
+        title = f"s [SPO] {resolved[0]}"
+        var_line = resolved[0]
+    return title, var_line
+
+
 def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                          all_tbl_indices, loaded_sav_name):
     """
     Convert multiple SPO parse results into a plan dict compatible
     with _apply_plan_outputs().
 
-    Returns (plan_dict, status_list) where status_list has one entry per
-    SPO file: {'filename': str, 'ok': bool, 'reason': str, 'n_outputs': int}
+    Returns (plan_dict, status_list, synthetic_entries) where:
+      - status_list has one entry per SPO file
+      - synthetic_entries is a list of (title, var_line) tuples to append
     """
     status_list = []
     all_outputs = []
     col_lc = {c.lower(): c for c in df.columns}
+    # Work with mutable copies so synthetic entries get proper indices
+    titles = list(titles)
+    variables = list(variables)
+    synthetic_entries = []
 
     for spo in spo_results:
         fname = spo['filename']
@@ -894,6 +931,48 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             tbl = mi['spo_table']
             if mi['match_status'] == 'no_match':
                 continue
+
+            # ── df_only: vars in dataset but not in input.txt → add synthetic entries ──
+            if mi['match_status'] == 'df_only':
+                if tbl['is_mr']:
+                    # One synthetic MR entry for the whole group
+                    entry = _build_synthetic_entry(tbl, col_lc)
+                    if entry:
+                        new_idx = len(titles)
+                        titles.append(entry[0])
+                        variables.append(entry[1])
+                        synthetic_entries.append(entry)
+                        mi['matched_indices'] = [new_idx]
+                    else:
+                        continue
+                elif tbl['is_numeric']:
+                    # One synthetic numeric entry
+                    entry = _build_synthetic_entry(tbl, col_lc)
+                    if entry:
+                        new_idx = len(titles)
+                        titles.append(entry[0])
+                        variables.append(entry[1])
+                        synthetic_entries.append(entry)
+                        mi['matched_indices'] = [new_idx]
+                    else:
+                        continue
+                else:
+                    # One simple entry per row_var
+                    new_indices = []
+                    for rv in tbl['row_vars']:
+                        resolved = col_lc.get(rv.lower())
+                        if resolved:
+                            new_idx = len(titles)
+                            title = f"s [SPO] {resolved}"
+                            titles.append(title)
+                            variables.append(resolved)
+                            synthetic_entries.append((title, resolved))
+                            new_indices.append(new_idx)
+                    if new_indices:
+                        mi['matched_indices'] = new_indices
+                    else:
+                        continue
+                mi['_was_df_only'] = True
 
             # Build output definition
             out = {
@@ -948,14 +1027,20 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             n_ok += 1
 
         if n_ok > 0:
+            n_synth = sum(1 for m in matches
+                          if m.get('_was_df_only'))
+            msg = f'{n_ok} output(a) prepoznato'
+            if n_synth:
+                msg += f' ({n_synth} dodano u input skriptu)'
             status_list.append({
                 'filename': fname,
                 'ok': True,
-                'reason': f'{n_ok} output(a) prepoznato',
+                'reason': msg,
                 'n_outputs': n_ok,
             })
         else:
-            reasons = set(m['reason'] for m in matches if m['match_status'] == 'no_match')
+            reasons = set(m['reason'] for m in matches
+                          if m['match_status'] in ('no_match', 'df_only'))
             reason_str = '; '.join(reasons) if reasons else 'Varijable iz SPO ne odgovaraju input.txt tablicama'
             status_list.append({
                 'filename': fname,
@@ -975,7 +1060,7 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
         },
         'outputs': all_outputs,
     }
-    return plan, status_list
+    return plan, status_list, synthetic_entries
 
 
 def _apply_plan_outputs(plan, cat_var_names, filter_choices,
@@ -1445,7 +1530,7 @@ def main():
                     })
 
             loaded_sav_name = st.session_state.get('_sav_name', '')
-            plan_from_spo, spo_status = _build_plan_from_spo(
+            plan_from_spo, spo_status, spo_synthetics = _build_plan_from_spo(
                 spo_results, titles, variables, df,
                 # cat_var_names not ready yet — compute quickly
                 [c for c in df.columns if 2 <= df[c].dropna().nunique() <= 30],
@@ -1453,6 +1538,18 @@ def main():
                  if get_table_type(t) in ('s', 'k', 'd', 'n', 'm')],
                 loaded_sav_name,
             )
+
+            # Append synthetic input entries to session_state
+            if spo_synthetics:
+                ext_titles = list(st.session_state['titles'])
+                ext_vars = list(st.session_state['variables'])
+                for syn_title, syn_var in spo_synthetics:
+                    ext_titles.append(syn_title)
+                    ext_vars.append(syn_var)
+                st.session_state['titles'] = ext_titles
+                st.session_state['variables'] = ext_vars
+                titles = ext_titles
+                variables = ext_vars
 
             st.session_state['_spo_status'] = spo_status
             st.session_state['_spo_applied_batch'] = _spo_batch_key
