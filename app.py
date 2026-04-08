@@ -839,12 +839,12 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             'sheet_name': od['sheet_name'],
             'filter_groups': od.get('filter_groups', []),
         }
+        out['table_indices'] = od.get('table_indices', [])
+        out['table_mode'] = st.session_state.get(f'out_tblmode_{oi}', 'all')
         if od['type'] == 'krizanje':
             out['banner_vars'] = od.get('banner_vars', [])
             out['show_sig'] = od.get('show_sig', False)
             out['show_sig_total'] = od.get('show_sig_total', False)
-            out['table_indices'] = od.get('table_indices', [])
-            out['table_mode'] = st.session_state.get(f'out_tblmode_{oi}', 'all')
         plan['outputs'].append(out)
     return plan
 
@@ -871,24 +871,28 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
                     st.session_state[f'fg_logic_{oi}_{fi}'] = logic_val
 
                 if fgroup.get('mode') == 'multi':
-                    saved_vars = set(fgroup.get('vals', []))
-                    fc_idx = 0
+                    saved_vars = set(fgroup.get('vars', []))
+                    fc_idx = None
                     for j, fc in enumerate(filter_choices):
                         if fc['mode'] == 'multi' and set(fc['vars']) == saved_vars:
                             fc_idx = j
                             break
+                    if fc_idx is None:
+                        continue  # skip filter group — vars no longer exist
                     st.session_state[f'fg_var_{oi}_{fi}'] = fc_idx
-                    matched_fc = filter_choices[fc_idx] if filter_choices else {'vars': []}
+                    matched_fc = filter_choices[fc_idx]
                     val_idx = [matched_fc['vars'].index(v)
                                for v in fgroup['vals'] if v in matched_fc['vars']]
                     st.session_state[f'fg_vals_{oi}_{fi}'] = val_idx
                 else:
                     the_var = fgroup.get('var', '')
-                    fc_idx = 0
+                    fc_idx = None
                     for j, fc in enumerate(filter_choices):
                         if fc['mode'] == 'single' and fc['vars'][0] == the_var:
                             fc_idx = j
                             break
+                    if fc_idx is None:
+                        continue  # skip filter group — var no longer exists
                     st.session_state[f'fg_var_{oi}_{fi}'] = fc_idx
                     # Map saved values to indices in unique_vals
                     try:
@@ -906,6 +910,17 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
                                 break
                     st.session_state[f'fg_vals_{oi}_{fi}'] = val_idx
 
+        # ── Table selection (both types) ──
+        tbl_mode = out.get('table_mode', 'all')
+        st.session_state[f'out_tblmode_{oi}'] = tbl_mode
+        saved_set = set(out.get('table_indices', []))
+        if tbl_mode == 'exclude':
+            st.session_state[f'out_excl_{oi}'] = [
+                j for j, idx in enumerate(all_tbl_indices) if idx not in saved_set]
+        elif tbl_mode == 'select':
+            st.session_state[f'out_sel_{oi}'] = [
+                j for j, idx in enumerate(all_tbl_indices) if idx in saved_set]
+
         # ── Križanje settings ──
         if out.get('type') == 'krizanje':
             banner_idx = [cat_var_names.index(v)
@@ -913,16 +928,6 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
             st.session_state[f'out_banner_{oi}'] = banner_idx
             st.session_state[f'out_sig_{oi}'] = out.get('show_sig', True)
             st.session_state[f'out_sigtot_{oi}'] = out.get('show_sig_total', False)
-
-            tbl_mode = out.get('table_mode', 'all')
-            st.session_state[f'out_tblmode_{oi}'] = tbl_mode
-            saved_set = set(out.get('table_indices', []))
-            if tbl_mode == 'exclude':
-                st.session_state[f'out_excl_{oi}'] = [
-                    j for j, idx in enumerate(all_tbl_indices) if idx not in saved_set]
-            elif tbl_mode == 'select':
-                st.session_state[f'out_sel_{oi}'] = [
-                    j for j, idx in enumerate(all_tbl_indices) if idx in saved_set]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1064,7 +1069,9 @@ def main():
 
     def _invalidate_data_indices():
         """Clear index-based session state keys that depend on data/input file contents."""
-        _n_out = st.session_state.get('n_outputs', 1)
+        # Use max of current and any previous n_outputs to clear all remnants
+        _n_out = max(st.session_state.get('n_outputs', 1),
+                     st.session_state.get('_prev_n_outputs', 1))
         for _oi in range(_n_out):
             for _k in (f'out_banner_{_oi}', f'out_excl_{_oi}', f'out_sel_{_oi}'):
                 st.session_state.pop(_k, None)
@@ -1076,13 +1083,16 @@ def main():
         for _fi in range(st.session_state.get('n_gfg', 0) + 1):
             st.session_state.pop(f'gfg_var_{_fi}', None)
             st.session_state.pop(f'gfg_vals_{_fi}', None)
+            st.session_state.pop(f'gfg_logic_{_fi}', None)
+        # Remember peak n_outputs for future invalidation
+        st.session_state['_prev_n_outputs'] = _n_out
         # Also clean from snapshot
         snap = st.session_state.get('_widget_snap')
         if snap:
             for _k in list(snap.keys()):
                 if _k.startswith(('out_banner_', 'out_excl_', 'out_sel_',
                                   'fg_var_', 'fg_vals_',
-                                  'gfg_var_', 'gfg_vals_')) or _k == 'weight_idx':
+                                  'gfg_var_', 'gfg_vals_', 'gfg_logic_')) or _k == 'weight_idx':
                     del snap[_k]
 
     def _reset_data():
@@ -1474,24 +1484,28 @@ def main():
                     _logic_val = "ILI (OR)" if _fgroup.get('logic') == 'OR' else "I (AND)"
                     st.session_state[f'gfg_logic_{_fi}'] = _logic_val
                 if _fgroup.get('mode') == 'multi':
-                    _saved_vars = set(_fgroup.get('vals', []))
-                    _fc_idx = 0
+                    _saved_vars = set(_fgroup.get('vars', []))
+                    _fc_idx = None
                     for _j, _fc in enumerate(filter_choices):
                         if _fc['mode'] == 'multi' and set(_fc['vars']) == _saved_vars:
                             _fc_idx = _j
                             break
+                    if _fc_idx is None:
+                        continue  # skip — vars no longer exist
                     st.session_state[f'gfg_var_{_fi}'] = _fc_idx
-                    _matched_fc = filter_choices[_fc_idx] if filter_choices else {'vars': []}
+                    _matched_fc = filter_choices[_fc_idx]
                     _val_idx = [_matched_fc['vars'].index(_v)
                                 for _v in _fgroup['vals'] if _v in _matched_fc['vars']]
                     st.session_state[f'gfg_vals_{_fi}'] = _val_idx
                 else:
                     _the_var = _fgroup.get('var', '')
-                    _fc_idx = 0
+                    _fc_idx = None
                     for _j, _fc in enumerate(filter_choices):
                         if _fc['mode'] == 'single' and _fc['vars'][0] == _the_var:
                             _fc_idx = _j
                             break
+                    if _fc_idx is None:
+                        continue  # skip — var no longer exists
                     st.session_state[f'gfg_var_{_fi}'] = _fc_idx
                     try:
                         _unique_vals = sorted(

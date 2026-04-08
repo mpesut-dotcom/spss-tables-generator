@@ -474,6 +474,9 @@ def write_tables_to_excel(tables, output_path, design='hendal'):
         # ── Determine which columns are count (n/N) columns ──
         _n_cols = {ci for ci, h in enumerate(header, 1)
                    if str(h).strip().lower() in ('n',)}
+        # ── Determine which columns are 2-decimal stat columns (Mean, SD, etc.) ──
+        _stat_cols = {ci for ci, h in enumerate(header, 1)
+                      if str(h).strip().lower() in ('mean', 'std.dev.', 'median', 'min', 'max')}
 
         # ── Data redovi ──
         for i, data_row in enumerate(data_rows):
@@ -489,7 +492,12 @@ def write_tables_to_excel(tables, output_path, design='hendal'):
                     cell.value = '.'  # type: ignore[assignment]
                 elif isinstance(val, float):
                     cell.value = val  # type: ignore[assignment]
-                    cell.number_format = '0' if col_idx in _n_cols else '0.0'
+                    if col_idx in _n_cols:
+                        cell.number_format = '0'
+                    elif col_idx in _stat_cols:
+                        cell.number_format = '0.00'
+                    else:
+                        cell.number_format = '0.0'
                 elif isinstance(val, (int, np.integer)):
                     cell.value = int(val)  # type: ignore[assignment]
                     cell.number_format = '#,##0'
@@ -804,8 +812,10 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
                 w = df.loc[mask, weight_col].values
                 if len(col_vals) > 0 and w.sum() > 0:
                     m = float(np.average(col_vals.values, weights=w))
-                    sd = float(np.sqrt(np.average((col_vals.values - m) ** 2, weights=w)))
-                    n = float(w.sum())
+                    w_var = float(np.average((col_vals.values - m) ** 2, weights=w))
+                    w_sum = w.sum()
+                    sd = float(np.sqrt(w_var * w_sum / (w_sum - 1))) if w_sum > 1 else 0.0
+                    n = float(w_sum)
                 else:
                     m, sd, n = 0, 0, 0
             else:
@@ -826,8 +836,10 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
             w = df.loc[mask_total, weight_col].values
             if len(col_vals_total) > 0 and w.sum() > 0:
                 m = float(np.average(col_vals_total.values, weights=w))
-                sd = float(np.sqrt(np.average((col_vals_total.values - m) ** 2, weights=w)))
-                n = float(w.sum())
+                w_var = float(np.average((col_vals_total.values - m) ** 2, weights=w))
+                w_sum = w.sum()
+                sd = float(np.sqrt(w_var * w_sum / (w_sum - 1))) if w_sum > 1 else 0.0
+                n = float(w_sum)
             else:
                 m, sd, n = 0, 0, 0
         else:
@@ -1011,7 +1023,9 @@ def merge_crosstabs_banner(crosstabs):
     total_n = first['col_ns'][first_n_break]  # last element
     if is_numeric:
         total_means = [row[first_n_break] for row in first['mean_matrix']]
-        total_sds = [row[first_n_break] for row in first.get('sd_matrix', [])]
+        _raw_sds = [row[first_n_break] for row in first.get('sd_matrix', [])]
+        # Pad total_sds to same length as total_means to prevent IndexError
+        total_sds = _raw_sds + [0.0] * (len(total_means) - len(_raw_sds))
     else:
         total_pcts = [row[first_n_break] for row in first['pct_matrix']]
 
@@ -1041,7 +1055,13 @@ def _make_global_letters(groups):
     idx = 0
     for grp in groups:
         for ci, lbl in enumerate(grp['col_labels']):
-            letter = SIG_LETTERS[idx] if idx < len(SIG_LETTERS) else f'A{idx}'
+            if idx < len(SIG_LETTERS):
+                letter = SIG_LETTERS[idx]
+            else:
+                # Generate AA, AB, ... for overflow beyond 52
+                first = SIG_LETTERS[(idx - len(SIG_LETTERS)) // len(SIG_LETTERS) % len(SIG_LETTERS)]
+                second = SIG_LETTERS[(idx - len(SIG_LETTERS)) % len(SIG_LETTERS)]
+                letter = first + second
             letters.append(letter)
             legend.append((letter, lbl))
             idx += 1
@@ -1085,8 +1105,10 @@ def compute_sig_total_banner(banner):
 
                 if is_numeric:
                     col_val = grp['mean_matrix'][ri][ci]
-                    col_sd = grp.get('sd_matrix', [[0]*n_cols]*n_rows)[ri][ci]
-                    col_n_i = grp.get('n_matrix', [[0]*n_cols]*n_rows)[ri][ci]
+                    _sd_fallback = grp.get('sd_matrix') or [[0]*n_cols for _ in range(n_rows)]
+                    _n_fallback = grp.get('n_matrix') or [[0]*n_cols for _ in range(n_rows)]
+                    col_sd = _sd_fallback[ri][ci] if ri < len(_sd_fallback) and ci < len(_sd_fallback[ri]) else 0
+                    col_n_i = _n_fallback[ri][ci] if ri < len(_n_fallback) and ci < len(_n_fallback[ri]) else 0
                     z = _mean_sig(total_val, col_val, total_sd, col_sd,
                                   total_n, col_n_i if col_n_i else col_n)
                 else:
@@ -1280,7 +1302,9 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
                 if is_numeric:
                     val = grp['mean_matrix'][ri][ci]
                     sig = grp['sig_matrix'][ri][ci] if (show_sig and not show_sig_total and ri < len(grp['sig_matrix'])) else ''
-                    if val == 0 and grp.get('n_matrix', [[]])[ri][ci] == 0:
+                    _nm = grp.get('n_matrix', [])
+                    _n_val = _nm[ri][ci] if ri < len(_nm) and ci < len(_nm[ri]) else None
+                    if val == 0 and _n_val == 0:
                         cell.value = '.'
                     elif sig:
                         cell.value = f"{val:.2f}\n{sig}"
