@@ -1078,6 +1078,7 @@ def main():
             for _fi in range(st.session_state.get(f'n_fg_{_oi}', 0) + 1):
                 st.session_state.pop(f'fg_var_{_oi}_{_fi}', None)
                 st.session_state.pop(f'fg_vals_{_oi}_{_fi}', None)
+                st.session_state.pop(f'fg_logic_{_oi}_{_fi}', None)
         st.session_state.pop('weight_idx', None)
         # Clear global filter indices
         for _fi in range(st.session_state.get('n_gfg', 0) + 1):
@@ -1091,7 +1092,7 @@ def main():
         if snap:
             for _k in list(snap.keys()):
                 if _k.startswith(('out_banner_', 'out_excl_', 'out_sel_',
-                                  'fg_var_', 'fg_vals_',
+                                  'fg_var_', 'fg_vals_', 'fg_logic_',
                                   'gfg_var_', 'gfg_vals_', 'gfg_logic_')) or _k == 'weight_idx':
                     del snap[_k]
 
