@@ -27,6 +27,7 @@ from openpyxl import load_workbook
 
 
 # Importaj engine funkcije iz spss_tables.py
+from spo_parser import parse_spo, sav_names_match, parse_filter_expression, match_spo_to_input
 from spss_tables import (
     build_column_map,
     compute_sig_total_banner,
@@ -563,62 +564,6 @@ def validate_datafile(df, meta, input_vars=None):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  FORCE ALL VARIABLES — auto-generate titles/variables for .sav columns
-# ═══════════════════════════════════════════════════════════════════
-
-def _generate_extra_entries(df, meta, existing_titles, existing_variables):
-    """
-    Za sve varijable iz df koje NISU definirane u existing input skripti,
-    generiraj title/variable parove koristeći SPSS metapodatke.
-
-    Kategoričke (imaju value labels ili ≤30 unique) → tip 's'
-    Numeričke (continuous) → tip 'n'
-
-    Returns: (extra_titles, extra_variables) — lists to append.
-    """
-    labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
-    val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
-
-    # Collect all vars already defined in input script
-    existing_vars = set()
-    col_set_lc = {c.lower(): c for c in df.columns}
-    for var_line in existing_variables:
-        for v in _extract_vars_from_line(var_line):
-            resolved = col_set_lc.get(v.lower())
-            if resolved:
-                existing_vars.add(resolved)
-
-    extra_titles = []
-    extra_variables = []
-
-    for col in df.columns:
-        if col in existing_vars:
-            continue
-
-        var_label = labels_dict.get(col, '')
-        display_name = var_label if var_label and var_label != col else col
-        has_val_labels = bool(val_labels_dict.get(col))
-        nunique = df[col].dropna().nunique()
-        is_numeric = pd.api.types.is_numeric_dtype(df[col])
-
-        if has_val_labels or (nunique <= 30 and nunique >= 1):
-            # Categorical → simple frequency table
-            extra_titles.append(f"s {display_name}:")
-            extra_variables.append(col)
-        elif is_numeric and nunique > 0:
-            # Numeric → mean table (type 'n')
-            # Format: left half = var name, right half = var+expression
-            # Pad so midpoint split works: "var  var"
-            pad = max(len(col), 1)
-            var_line = col.ljust(pad + 1) + col
-            extra_titles.append(f"n {display_name} - MEAN")
-            extra_variables.append(var_line)
-        # Skip columns with 0 unique values (all NaN)
-
-    return extra_titles, extra_variables
-
-
-# ═══════════════════════════════════════════════════════════════════
 #  GRUPIRANJE VARIJABLI IZ INPUT DEFINICIJA
 # ═══════════════════════════════════════════════════════════════════
 
@@ -885,7 +830,6 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             'weight_col': weight_col,
             'start_num': int(start_num),
             'add_toc': bool(st.session_state.get('add_toc', False)),
-            'force_all_vars': bool(st.session_state.get('force_all_vars', False)),
             'filter_groups': global_filter_groups or [],
         },
         'outputs': [],
@@ -904,6 +848,134 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             out['show_sig_total'] = od.get('show_sig_total', False)
         plan['outputs'].append(out)
     return plan
+
+
+def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
+                         all_tbl_indices, loaded_sav_name):
+    """
+    Convert multiple SPO parse results into a plan dict compatible
+    with _apply_plan_outputs().
+
+    Returns (plan_dict, status_list) where status_list has one entry per
+    SPO file: {'filename': str, 'ok': bool, 'reason': str, 'n_outputs': int}
+    """
+    status_list = []
+    all_outputs = []
+    col_lc = {c.lower(): c for c in df.columns}
+
+    for spo in spo_results:
+        fname = spo['filename']
+
+        # ── Check SAV compatibility ──
+        if not sav_names_match(spo.get('sav_name'), loaded_sav_name):
+            status_list.append({
+                'filename': fname,
+                'ok': False,
+                'reason': f"SAV ne odgovara: SPO koristi '{spo.get('sav_name', '?')}', "
+                          f"učitan je '{loaded_sav_name}'",
+                'n_outputs': 0,
+            })
+            continue
+
+        if not spo['tables']:
+            status_list.append({
+                'filename': fname,
+                'ok': False,
+                'reason': 'Nije pronađena nijedna tablica u SPO datoteci',
+                'n_outputs': 0,
+            })
+            continue
+
+        # ── Match tables to input.txt ──
+        matches = match_spo_to_input(spo, titles, variables, df.columns)
+        n_ok = 0
+
+        for mi in matches:
+            tbl = mi['spo_table']
+            if mi['match_status'] == 'no_match':
+                continue
+
+            # Build output definition
+            out = {
+                'type': tbl['type'] or 'total',
+                'sheet_name': '',
+                'filter_groups': [],
+                'table_indices': mi['matched_indices'],
+                'table_mode': 'select',
+            }
+
+            # ── Filter groups (from SPO filter expression) ──
+            filter_expr = tbl.get('filter_expr') or (
+                spo['filters'][0] if len(spo['filters']) == 1 else None
+            )
+            if filter_expr:
+                parsed_filters = parse_filter_expression(filter_expr)
+                for pf in parsed_filters:
+                    var_name = pf['var']
+                    # Resolve case
+                    resolved = col_lc.get(var_name.lower())
+                    if resolved:
+                        out['filter_groups'].append({
+                            'mode': 'single',
+                            'var': resolved,
+                            'vals': [float(v) if isinstance(v, int) else v for v in pf['vals']],
+                            'logic': 'AND',
+                        })
+
+            # ── Banner (for krizanje) ──
+            if tbl['type'] == 'krizanje' and tbl.get('banner_var'):
+                bvar = col_lc.get(tbl['banner_var'].lower())
+                if bvar and bvar in cat_var_names:
+                    out['banner_vars'] = [bvar]
+                    out['show_sig'] = True
+                    out['show_sig_total'] = False
+                else:
+                    # Banner var not categorical — fall back to total
+                    out['type'] = 'total'
+
+            # ── Sheet name ──
+            base = 'TOTAL' if out['type'] == 'total' else 'CROSS'
+            if out.get('banner_vars'):
+                base = 'CROSS_' + '_'.join(out['banner_vars'])
+            if out['filter_groups']:
+                fvar = out['filter_groups'][0].get('var', '')
+                fvals = out['filter_groups'][0].get('vals', [])
+                fstr = f"{fvar}={'_'.join(str(int(v)) for v in fvals)}"
+                base = f"{base}_{fstr}"
+            out['sheet_name'] = base[:31]
+
+            all_outputs.append(out)
+            n_ok += 1
+
+        if n_ok > 0:
+            status_list.append({
+                'filename': fname,
+                'ok': True,
+                'reason': f'{n_ok} output(a) prepoznato',
+                'n_outputs': n_ok,
+            })
+        else:
+            reasons = set(m['reason'] for m in matches if m['match_status'] == 'no_match')
+            reason_str = '; '.join(reasons) if reasons else 'Varijable iz SPO ne odgovaraju input.txt tablicama'
+            status_list.append({
+                'filename': fname,
+                'ok': False,
+                'reason': reason_str[:200],
+                'n_outputs': 0,
+            })
+
+    plan = {
+        'version': 1,
+        'global': {
+            'use_weight': False,
+            'weight_col': '',
+            'start_num': 1,
+            'add_toc': False,
+            'filter_groups': [],
+        },
+        'outputs': all_outputs,
+    }
+    return plan, status_list
 
 
 def _apply_plan_outputs(plan, cat_var_names, filter_choices,
@@ -1103,8 +1175,7 @@ def main():
         'gfg_logic_', 'gfg_var_', 'gfg_vals_',
     )
     _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'table_design',
-                       'n_outputs', '_out_order', 'global_filt', 'n_gfg',
-                       'force_all_vars')
+                       'n_outputs', '_out_order', 'global_filt', 'n_gfg')
 
     def _snapshot_widget_config():
         # Don't overwrite an existing snapshot (e.g. saved by _reset_data
@@ -1173,11 +1244,14 @@ def main():
                 del st.session_state[k]
         # Rotate plan uploader key
         st.session_state['_plan_ugen'] = st.session_state.get('_plan_ugen', 0) + 1
+        # Clear SPO import state
+        st.session_state.pop('_spo_applied_batch', None)
+        st.session_state.pop('_spo_status', None)
+        st.session_state['_spo_ugen'] = st.session_state.get('_spo_ugen', 0) + 1
         # Reset global settings
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
         st.session_state['table_design'] = 'hendal'
-        st.session_state['force_all_vars'] = False
         # Reset global filter
         st.session_state['global_filt'] = False
         n_gfg_prev = st.session_state.get('n_gfg', 0)
@@ -1206,11 +1280,13 @@ def main():
         """Clear everything — data, outputs, all settings."""
         dgen = st.session_state.get('_data_ugen', 0) + 1
         pgen = st.session_state.get('_plan_ugen', 0) + 1
+        spogen = st.session_state.get('_spo_ugen', 0) + 1
         n_prev = st.session_state.get('n_outputs', 1)
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.session_state['_data_ugen'] = dgen
         st.session_state['_plan_ugen'] = pgen
+        st.session_state['_spo_ugen'] = spogen
         # Explicitly set widget keys to defaults so Streamlit's internal
         # widget cache is overridden on next render
         st.session_state['use_weight'] = False
@@ -1334,6 +1410,65 @@ def main():
             except (json.JSONDecodeError, UnicodeDecodeError):
                 st.error("❌ Neispravan JSON fajl.")
 
+    # ── SPO import (opcionalno) ──
+    st.subheader("📊 Import iz SPO")
+    _spogen = st.session_state.get('_spo_ugen', 0)
+    spo_files = st.file_uploader(
+        "Učitajte .spo datoteke za automatsko prepoznavanje outputa",
+        type=["spo"],
+        accept_multiple_files=True,
+        help="Uploadajte jedan ili više SPSS Output (.spo) fajlova. "
+             "Aplikacija će analizirati svaki i pokušati rekonstruirati postavke outputa.",
+        key=f"spo_upload_{_spogen}",
+    )
+    if spo_files and df is not None and titles is not None:
+        # Track which batch we already processed
+        _spo_batch_key = '|'.join(sorted(f.name for f in spo_files))
+        if st.session_state.get('_spo_applied_batch') != _spo_batch_key:
+            spo_results = []
+            for spo_f in spo_files:
+                try:
+                    spo_bytes = spo_f.read()
+                    tmp_path = os.path.join(tempfile.gettempdir(), spo_f.name)
+                    with open(tmp_path, 'wb') as fout:
+                        fout.write(spo_bytes)
+                    result = parse_spo(tmp_path)
+                    spo_results.append(result)
+                    os.unlink(tmp_path)
+                except Exception as exc:
+                    spo_results.append({
+                        'filename': spo_f.name,
+                        'sav_name': None,
+                        'filters': [],
+                        'tables': [],
+                        '_error': str(exc),
+                    })
+
+            loaded_sav_name = st.session_state.get('_sav_name', '')
+            plan_from_spo, spo_status = _build_plan_from_spo(
+                spo_results, titles, variables, df,
+                # cat_var_names not ready yet — compute quickly
+                [c for c in df.columns if 2 <= df[c].dropna().nunique() <= 30],
+                [i for i, t in enumerate(titles)
+                 if get_table_type(t) in ('s', 'k', 'd', 'n', 'm')],
+                loaded_sav_name,
+            )
+
+            st.session_state['_spo_status'] = spo_status
+            st.session_state['_spo_applied_batch'] = _spo_batch_key
+
+            if plan_from_spo['outputs']:
+                st.session_state['_pending_plan'] = plan_from_spo
+                st.session_state['_plan_applied_name'] = f'_spo_import_{_spo_batch_key}'
+
+    # Show SPO status (persists across reruns)
+    if '_spo_status' in st.session_state:
+        for s in st.session_state['_spo_status']:
+            if s['ok']:
+                st.success(f"✅ **{s['filename']}** — {s['reason']}")
+            else:
+                st.error(f"❌ **{s['filename']}** — {s['reason']}")
+
     if df is None or titles is None:
         _snapshot_widget_config()
         st.info("👆 Učitajte oba fajla za nastavak.")
@@ -1409,7 +1544,6 @@ def main():
         _g = _pp.get('global', {})
         st.session_state['use_weight'] = _g.get('use_weight', False)
         st.session_state['add_toc'] = _g.get('add_toc', False)
-        st.session_state['force_all_vars'] = _g.get('force_all_vars', False)
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
@@ -1457,23 +1591,6 @@ def main():
         format_func=lambda x: {'hendal': '🟡 Hendal', 'mate': '🐉 Mate'}[x],
         key="table_design",
     )
-
-    st.subheader("📊 Force all variables")
-    force_all_vars = st.checkbox(
-        "Koristi sve varijable iz datafile-a",
-        key="force_all_vars",
-        help="Automatski dodaje tablice za sve varijable iz .sav fajla "
-             "koje nisu definirane u input skripti. "
-             "Kategoričke → frekvencije (s), numeričke → mean (n).",
-    )
-    if force_all_vars:
-        _extra_titles, _extra_variables = _generate_extra_entries(
-            df, meta, titles, variables)  # type: ignore[arg-type]
-        if _extra_titles:
-            titles = list(titles) + _extra_titles  # type: ignore[arg-type]
-            variables = list(variables) + _extra_variables  # type: ignore[arg-type]
-            st.caption(f"Dodano **{len(_extra_titles)}** tablica iz datafile-a "
-                       f"(ukupno {len(titles)})")
 
     # ── Priprema za filtre i krizanja ──
     var_groups = build_variable_groups(titles, variables, df.columns)
