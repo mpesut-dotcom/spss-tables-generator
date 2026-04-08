@@ -900,6 +900,18 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
     variables = list(variables)
     synthetic_entries = []
 
+    # Build MR group lookup: var_name_lower → list of resolved group vars
+    from spss_tables import get_table_type as _gtt, parse_mr_vars as _pmr
+    mr_lookup = {}
+    for _t, _v in zip(titles, variables):
+        if _gtt(_t) in ('k', 'd'):
+            _vs = _v.strip()
+            raw = _pmr(_vs) if _vs.startswith('$') else _vs.split()
+            resolved = [col_lc[x.lower()] for x in raw if x.lower() in col_lc]
+            if len(resolved) > 1:
+                for rv in resolved:
+                    mr_lookup[rv.lower()] = resolved
+
     for spo in spo_results:
         fname = spo['filename']
 
@@ -943,6 +955,12 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                         variables.append(entry[1])
                         synthetic_entries.append(entry)
                         mi['matched_indices'] = [new_idx]
+                        # Update MR lookup with the new group
+                        resolved_mr = [col_lc[v.lower()] for v in tbl['mr_vars']
+                                       if v.lower() in col_lc]
+                        if len(resolved_mr) > 1:
+                            for rv in resolved_mr:
+                                mr_lookup[rv.lower()] = resolved_mr
                     else:
                         continue
                 elif tbl['is_numeric']:
@@ -991,13 +1009,24 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
                 parsed_filters = parse_filter_expression(filter_expr)
                 for pf in parsed_filters:
                     var_name = pf['var']
-                    # Resolve case
                     resolved = col_lc.get(var_name.lower())
-                    if resolved:
+                    if not resolved:
+                        continue
+                    vals_f = [float(v) if isinstance(v, int) else v for v in pf['vals']]
+                    # Check if var is part of an MR group → multi filter
+                    mr_group = mr_lookup.get(resolved.lower())
+                    if mr_group:
+                        out['filter_groups'].append({
+                            'mode': 'multi',
+                            'vars': mr_group,
+                            'vals': vals_f,
+                            'logic': 'AND',
+                        })
+                    else:
                         out['filter_groups'].append({
                             'mode': 'single',
                             'var': resolved,
-                            'vals': [float(v) if isinstance(v, int) else v for v in pf['vals']],
+                            'vals': vals_f,
                             'logic': 'AND',
                         })
 
@@ -1017,8 +1046,13 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             if out.get('banner_vars'):
                 base = 'CROSS_' + '_'.join(out['banner_vars'])
             if out['filter_groups']:
-                fvar = out['filter_groups'][0].get('var', '')
-                fvals = out['filter_groups'][0].get('vals', [])
+                fg0 = out['filter_groups'][0]
+                if fg0.get('mode') == 'multi':
+                    # Use first var of the MR group for naming
+                    fvar = fg0.get('vars', [''])[0]
+                else:
+                    fvar = fg0.get('var', '')
+                fvals = fg0.get('vals', [])
                 fstr = f"{fvar}={'_'.join(str(int(v)) for v in fvals)}"
                 base = f"{base}_{fstr}"
             out['sheet_name'] = base[:31]
@@ -1095,8 +1129,25 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
                         continue  # skip filter group — vars no longer exist
                     st.session_state[f'fg_var_{oi}_{fi}'] = fc_idx
                     matched_fc = filter_choices[fc_idx]
-                    val_idx = [matched_fc['vars'].index(v)
-                               for v in fgroup['vals'] if v in matched_fc['vars']]
+                    # Build _all_vals the same way the UI does
+                    _all_vals_set = set()
+                    for _sv in matched_fc['vars']:
+                        if _sv in df.columns:
+                            for _uv in df[_sv].dropna().unique():
+                                _all_vals_set.add(_uv)
+                    try:
+                        _all_vals = sorted(
+                            _all_vals_set,
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except TypeError:
+                        _all_vals = sorted(_all_vals_set, key=str)
+                    val_idx = []
+                    for sv in fgroup.get('vals', []):
+                        for k, uv in enumerate(_all_vals):
+                            if uv == sv or str(uv) == str(sv):
+                                val_idx.append(k)
+                                break
                     st.session_state[f'fg_vals_{oi}_{fi}'] = val_idx
                 else:
                     the_var = fgroup.get('var', '')
@@ -1786,8 +1837,25 @@ def main():
                         continue  # skip — vars no longer exist
                     st.session_state[f'gfg_var_{_fi}'] = _fc_idx
                     _matched_fc = filter_choices[_fc_idx]
-                    _val_idx = [_matched_fc['vars'].index(_v)
-                                for _v in _fgroup['vals'] if _v in _matched_fc['vars']]
+                    # Build _all_vals the same way the UI does
+                    _all_vals_set = set()
+                    for _sv in _matched_fc['vars']:
+                        if _sv in df.columns:
+                            for _uv in df[_sv].dropna().unique():
+                                _all_vals_set.add(_uv)
+                    try:
+                        _all_vals = sorted(
+                            _all_vals_set,
+                            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x))
+                        )
+                    except TypeError:
+                        _all_vals = sorted(_all_vals_set, key=str)
+                    _val_idx = []
+                    for _sv in _fgroup.get('vals', []):
+                        for _k, _uv in enumerate(_all_vals):
+                            if _uv == _sv or str(_uv) == str(_sv):
+                                _val_idx.append(_k)
+                                break
                     st.session_state[f'gfg_vals_{_fi}'] = _val_idx
                 else:
                     _the_var = _fgroup.get('var', '')
