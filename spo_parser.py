@@ -38,6 +38,49 @@ def _extract_text_runs(data, min_len=6):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Positional pairing of FILTERs → CTABLES
+# ═══════════════════════════════════════════════════════════════════
+
+def _build_positional_pairs(runs):
+    """
+    Walk text runs in binary order, pairing CTABLES blocks with their
+    preceding FILTER.  Each CTABLES inherits the filter that was most
+    recently set before it.
+
+    SPO stores each table twice (Notes + NavNote), so we deduplicate by
+    (syntax_key, filter_expr).  Crucially, the *same syntax* with a
+    *different filter* is kept as a separate table.
+
+    Returns [(ctables_syntax, filter_expr_or_None), ...].
+    """
+    current_filter = None
+    raw_pairs = []
+
+    for run in runs:
+        # Is this a FILTER declaration?
+        m = re.match(r'[&]?(.+?)\s*\(FILTER\)\s*$', run, re.IGNORECASE)
+        if m:
+            current_filter = m.group(1).strip()
+            continue
+
+        # Is this a CTABLES syntax block?
+        if 'TABLES' in run and ('/FORMAT' in run or '/FTOTAL' in run or '/STATISTICS' in run):
+            raw_pairs.append((run, current_filter))
+
+    # Deduplicate Notes+NavNote doubles.
+    # Key includes filter so same-syntax + different-filter → separate tables.
+    seen = set()
+    result = []
+    for syntax, filt in raw_pairs:
+        key = (syntax[:120], filt or '')
+        if key not in seen:
+            seen.add(key)
+            result.append((syntax, filt))
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  SPO file parsing
 # ═══════════════════════════════════════════════════════════════════
 
@@ -78,19 +121,9 @@ def parse_spo(filepath):
         m = re.match(r'[&]?(.+?)\s*\(FILTER\)\s*$', run, re.IGNORECASE)
         if m:
             filt_expr = m.group(1).strip()
-            if filt_expr not in all_filters:
-                all_filters.append(filt_expr)
-
-    # ── CTABLES syntax blocks ──
-    # These contain '/FORMAT', '/FTOTAL', or '/STATISTICS'
-    ctables_blocks = []
-    for run in runs:
-        if 'TABLES' in run and ('/FORMAT' in run or '/FTOTAL' in run or '/STATISTICS' in run):
-            ctables_blocks.append(run)
+            all_filters.append(filt_expr)
 
     # ── CROSSTABS syntax blocks ──
-    # Format: ...CROSSTABS\r  /TABLES=var BY var\r  /CELLS=COUNT COLUMN.
-    # The run may have a length-prefix byte char at the start (e.g. '9')
     crosstabs_blocks = []
     for run in runs:
         m = re.search(r'CROSSTABS\s+/TABLES=(\w+)\s+BY\s+(\w+)', run, re.IGNORECASE)
@@ -104,55 +137,53 @@ def parse_spo(filepath):
         if m:
             freq_blocks.append(run)
 
+    # ── Build positional (filter, CTABLES) pairs from runs order ──
+    paired_ctables = _build_positional_pairs(runs)
+
     # ── Parse all blocks into table definitions ──
     tables = []
-    seen_keys = set()  # deduplicate (syntax appears twice in SPO)
+    seen_keys = set()
 
-    # Assign filters to tables.
-    # Heuristic: if there are N unique CTABLES blocks and N unique filters,
-    # they correspond 1-to-1.  If there's only 1 unique filter, it's global.
-    # Otherwise map by order of appearance.
-    unique_ctables = _deduplicate_blocks(ctables_blocks)
-    unique_crosstabs = _deduplicate_blocks(crosstabs_blocks)
-    unique_freq = _deduplicate_blocks(freq_blocks)
-
-    # Determine filter assignment strategy
-    filter_map = _build_filter_map(all_filters, unique_ctables, data)
-
-    for i, ct in enumerate(unique_ctables):
-        parsed = _parse_ctables_syntax(ct)
+    for ct_syntax, filt_expr in paired_ctables:
+        parsed = _parse_ctables_syntax(ct_syntax)
         dedup_key = (parsed['type'], tuple(parsed['row_vars']),
                      tuple(parsed.get('mr_vars', [])), parsed['banner_var'],
-                     parsed['is_numeric'])
+                     parsed['is_numeric'], filt_expr or '')
         if dedup_key in seen_keys:
             continue
         seen_keys.add(dedup_key)
-        parsed['filter_expr'] = filter_map.get(i)
+        parsed['filter_expr'] = filt_expr
         tables.append(parsed)
+
+    unique_crosstabs = _deduplicate_blocks(crosstabs_blocks)
+    unique_freq = _deduplicate_blocks(freq_blocks)
 
     for cr_block in unique_crosstabs:
         parsed = _parse_crosstabs_syntax(cr_block)
         if parsed:
+            unique_filters = list(dict.fromkeys(all_filters))
             dedup_key = (parsed['type'], tuple(parsed['row_vars']),
-                         (), parsed['banner_var'], False)
+                         (), parsed['banner_var'], False,
+                         unique_filters[0] if len(unique_filters) == 1 else '')
             if dedup_key not in seen_keys:
                 seen_keys.add(dedup_key)
-                # CROSSTABS files typically have one global filter
-                parsed['filter_expr'] = all_filters[0] if len(all_filters) == 1 else None
+                parsed['filter_expr'] = unique_filters[0] if len(unique_filters) == 1 else None
                 tables.append(parsed)
 
     for fr_block in unique_freq:
         parsed = _parse_frequencies_syntax(fr_block)
         if parsed:
-            dedup_key = ('freq', tuple(parsed['row_vars']), (), None, False)
+            unique_filters = list(dict.fromkeys(all_filters))
+            dedup_key = ('freq', tuple(parsed['row_vars']), (), None, False,
+                         unique_filters[0] if len(unique_filters) == 1 else '')
             if dedup_key not in seen_keys:
                 seen_keys.add(dedup_key)
-                parsed['filter_expr'] = all_filters[0] if len(all_filters) == 1 else None
+                parsed['filter_expr'] = unique_filters[0] if len(unique_filters) == 1 else None
                 tables.append(parsed)
 
     return {
         'sav_name': sav_name,
-        'filters': all_filters,
+        'filters': list(dict.fromkeys(all_filters)),
         'tables': tables,
         'filename': os.path.basename(filepath),
     }
@@ -168,76 +199,6 @@ def _deduplicate_blocks(blocks):
             seen.add(key)
             result.append(b)
     return result
-
-
-def _build_filter_map(filters, ctables_blocks, raw_data):
-    """
-    Map filter expressions to the CTABLES block they precede.
-    In SPO binary, each CTABLES block appears twice (Notes + NavNote).
-    Filter expressions appear before their CTABLES blocks.
-    Multiple filters before the same block are combined with ' AND '.
-    """
-    if not filters:
-        return {}
-
-    unique_filters = list(dict.fromkeys(filters))  # preserve order, deduplicate
-    if len(unique_filters) == 1:
-        # Single filter → global, applies to all tables
-        return {i: unique_filters[0] for i in range(len(ctables_blocks))}
-
-    n_f = len(unique_filters)
-    n_b = len(ctables_blocks)
-
-    # When filters come in pairs (e.g. q8_X + q17_X for each table),
-    # pair them sequentially: filters[0]+[1]→block 0, [2]+[3]→block 1, etc.
-    if n_f == 2 * n_b:
-        fmap = {}
-        for i in range(n_b):
-            f1 = unique_filters[2 * i]
-            f2 = unique_filters[2 * i + 1]
-            fmap[i] = f'{f1} AND {f2}'
-        return fmap
-
-    # 1:1 mapping
-    if n_f == n_b:
-        return {i: unique_filters[i] for i in range(n_b)}
-
-    # Fallback: position-based mapping
-    text = raw_data.decode('latin-1', errors='replace')
-
-    filter_positions = []
-    for filt in unique_filters:
-        start = 0
-        while True:
-            pos = text.find(filt, start)
-            if pos < 0:
-                break
-            filter_positions.append((pos, filt))
-            start = pos + len(filt)
-    filter_positions.sort()
-
-    ctables_positions = []
-    for i, block in enumerate(ctables_blocks):
-        search_str = block[:200]
-        pos = text.find(search_str)
-        if pos >= 0:
-            ctables_positions.append((pos, i))
-    ctables_positions.sort()
-
-    if not ctables_positions:
-        return {i: unique_filters[0] for i in range(n_b)}
-
-    fmap = {}
-    for idx, (ct_pos, ct_idx) in enumerate(ctables_positions):
-        prev_ct_pos = ctables_positions[idx - 1][0] if idx > 0 else 0
-        preceding = []
-        for f_pos, f_expr in filter_positions:
-            if f_pos >= prev_ct_pos and f_pos < ct_pos:
-                if f_expr not in preceding:
-                    preceding.append(f_expr)
-        if preceding:
-            fmap[ct_idx] = ' AND '.join(preceding)
-    return fmap
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -265,7 +226,8 @@ def _parse_ctables_syntax(syntax):
         result['observation_var'] = obs_m.group(1)
 
     # /MRGROUP $name '' var1 var2 ... → multi-response
-    mr_m = re.search(r"/MRGROUP\s+\$\w+\s+'[^']*'\s+([\w\s]+?)(?=\s*/)", syntax, re.IGNORECASE)
+    # Lookahead for next '/' OR end-of-string (syntax may be truncated)
+    mr_m = re.search(r"/MRGROUP\s+\$\w+\s+'[^']*'\s+([\w\s]+?)(?=\s*/|$)", syntax, re.IGNORECASE)
     if mr_m:
         result['is_mr'] = True
         result['mr_vars'] = mr_m.group(1).strip().split()

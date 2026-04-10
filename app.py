@@ -1058,7 +1058,13 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             _content_parts = []
             for _di in out['table_indices']:
                 _content_parts.append((titles[_di], variables[_di]))
-            dedup_key = (tuple(_content_parts), out['sheet_name'], out['type'])
+            # Include filter in dedup key (same table + different filter = separate output)
+            _filter_key = tuple(
+                (fg.get('var', ''), tuple(sorted(fg.get('vars', []))),
+                 tuple(fg.get('vals', [])), fg.get('mode', ''))
+                for fg in out.get('filter_groups', [])
+            )
+            dedup_key = (tuple(_content_parts), out['sheet_name'], out['type'], _filter_key)
             if dedup_key in _seen_outputs:
                 continue
             _seen_outputs.add(dedup_key)
