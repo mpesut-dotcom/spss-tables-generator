@@ -759,6 +759,41 @@ def apply_filter_groups(df, filter_groups):
 
 def build_filter_groups_description(filter_groups, labels_dict, val_labels_dict):
     """Napravi citljiv opis filter grupa."""
+    def _short_text(value, limit):
+        text = '' if value is None else str(value)
+        return text[:limit]
+
+    def _lookup_value_label(vlabels, value):
+        if not hasattr(vlabels, 'get'):
+            return ''
+
+        candidates = [value]
+        try:
+            float_value = float(value)
+            candidates.append(float_value)
+            if float_value.is_integer():
+                candidates.append(int(float_value))
+        except (ValueError, TypeError):
+            pass
+
+        candidates.append(str(value))
+
+        for candidate in candidates:
+            try:
+                lbl = vlabels.get(candidate, '')
+            except TypeError:
+                continue
+            if lbl:
+                return lbl
+        return ''
+
+    def _lookup_multi_value_label(group_vars, value):
+        for group_var in group_vars:
+            lbl = _lookup_value_label(val_labels_dict.get(group_var, {}), value)
+            if lbl:
+                return lbl
+        return value
+
     parts = []
     for i, grp in enumerate(filter_groups):
         vals = grp.get('vals', [])
@@ -770,13 +805,17 @@ def build_filter_groups_description(filter_groups, labels_dict, val_labels_dict)
         group_label = grp.get('group_label', '')
 
         if mode == 'multi':
-            val_parts = [labels_dict.get(sv, sv)[:40] for sv in vals]
+            group_vars = grp.get('vars', [])
+            val_parts = [
+                _short_text(_lookup_multi_value_label(group_vars, value), 40)
+                for value in vals
+            ]
             val_str = ' ILI '.join(val_parts)
-            part = f"`{group_label[:35]}` = {val_str}"
+            part = f"`{_short_text(group_label, 35)}` = {val_str}"
         else:
             var = grp['var']
             var_lbl = labels_dict.get(var) or var
-            short_var = var_lbl[:35] if var_lbl != var else var
+            short_var = _short_text(var_lbl, 35) if var_lbl != var else str(var)
 
             vlabels = val_labels_dict.get(var, {})
             val_parts = []
