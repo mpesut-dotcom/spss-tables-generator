@@ -322,10 +322,7 @@ def make_numeric_table(df, var_string, meta, col_map, full_stats=True, weight_co
         col = vals[valid]
 
         if len(col) == 0:
-            if full_stats:
-                rows.append((str(label), '.', '.', '.', '.', '.', 0))
-            else:
-                rows.append((str(label), '.', 0))
+            continue
         else:
             if use_weight:
                 w = df.loc[valid, weight_col].values
@@ -808,13 +805,16 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
     col_letters = SIG_LETTERS[:len(break_vals)]
 
     # Za svaku varijablu: mean po svakom stupcu
-    row_labels = [get_var_label(v, meta) for v in var_names]
+    row_labels = []
     mean_matrix = []  # [row][col]
     sd_matrix = []    # za sig test
     n_matrix = []     # N po celiji
 
     for vname in var_names:
         vals = pd.to_numeric(df[vname], errors='coerce')
+        if not vals.notna().any():
+            continue
+        row_labels.append(get_var_label(vname, meta))
 
         row_means = []
         row_sds = []
@@ -875,7 +875,7 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
     # Sig test za meanove
     sig_matrix = []
     num_break = len(break_vals)
-    for ri in range(len(var_names)):
+    for ri in range(len(mean_matrix)):
         sig_row = []
         for ci in range(num_break + 1):
             if ci >= num_break:  # Total — nema sig testiranja
@@ -1555,6 +1555,10 @@ Potrebni paketi:
             else:
                 print(f"  [{table_num}] NEPOZNAT tip '{table_type}': {table_title[:60]}")
                 errors += 1
+                continue
+
+            if table_type in ('n', 'm') and not result.get('rows'):
+                print(f"  [{table_num:3d}] {table_type}: preskoceno - nema valjanih numeric podataka")
                 continue
 
             result['title'] = title_str

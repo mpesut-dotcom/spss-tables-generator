@@ -18,6 +18,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -584,15 +585,25 @@ def _extract_group_key(title):
 
 def _extract_vars_from_line(var_line):
     """Izvuci pojedinačne varijable iz var definicijskog reda."""
+    def _unique_tokens(tokens):
+        result = []
+        seen = set()
+        for token in tokens:
+            key = token.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(token)
+        return result
+
     var_line = var_line.strip()
     # MR: $e1 '' var1 var2 var3
     if var_line.startswith('$'):
-        return [p for p in var_line.split() if not p.startswith('$') and p != "''"]
+        return _unique_tokens([p for p in var_line.split() if not p.startswith('$') and p != "''"])
     # Numeric composite: q1_1 q1_2 ... q1_1+q1_2+...
     if '+' in var_line:
-        return [p for p in var_line.split() if '+' not in p]
-    # Simple single var
-    return [var_line] if var_line else []
+        return _unique_tokens([p for p in var_line.split() if '+' not in p])
+    # Simple or single-var MEAN line, e.g. "q2a" or "q2a q2a".
+    return _unique_tokens(var_line.split()) if var_line else []
 
 
 def build_variable_groups(titles, variables, df_columns):
@@ -679,6 +690,9 @@ def generate_tables(df, meta, titles, variables, weight_col, start_num):
                 result = make_freq_table(df, var_line, meta, col_map, weight_col)
             else:
                 errors.append(f"Tablica {table_num}: nepoznat tip '{table_type}'")
+                continue
+
+            if table_type in ('n', 'm') and not result.get('rows'):
                 continue
 
             result['title'] = title_str
@@ -860,6 +874,542 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def _json_cell(value):
+    """Serialize structured values for storage in a worksheet cell."""
+    if value is None:
+        return ''
+    return json.dumps(value, ensure_ascii=False, cls=_NumpyEncoder)
+
+
+def _excel_cell_value(value):
+    """Convert numpy/pandas-ish values into values openpyxl can store."""
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (dict, list, tuple, set)):
+        return _json_cell(list(value) if isinstance(value, set) else value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return _json_cell(value.tolist())
+    if isinstance(value, bool):
+        return value
+    return value
+
+
+def _normalize_user_text(value):
+    if value is None:
+        return ''
+    return str(value).replace('\r\n', '\n').replace('\r', '\n').replace('\\n', '\n')
+
+
+class AiMetaBuilder:
+    """Collect and write parser-friendly metadata for AI context export."""
+    SECTION_COLUMNS = {
+        'META': ['key', 'value', 'source', 'notes'],
+        'SHEETS': ['sheet_name', 'role', 'output_id', 'base_sheet_name',
+                   'table_block_count', 'hidden'],
+        'OUTPUTS': ['output_id', 'sheet_base_name', 'output_type',
+                    'actual_sheet_base', 'actual_sheet_sig',
+                    'actual_sheet_sig_total', 'selected_table_indices_json',
+                    'selected_table_count', 'banner_vars_json',
+                    'banner_labels_json', 'show_sig', 'show_sig_total',
+                    'global_filter_description', 'output_filter_description',
+                    'effective_filter_description', 'filter_groups_json',
+                    'global_filter_groups_json', 'n_unfiltered',
+                    'n_after_global_filter', 'n_after_effective_filter',
+                    'weight_col'],
+        'FILTERS': ['scope', 'output_id', 'condition_order',
+                    'logic_with_previous', 'mode', 'var', 'vars_json',
+                    'group_label', 'var_label', 'value_codes_json',
+                    'value_labels_json', 'description'],
+        'TABLES': ['table_idx', 'table_number', 'q_code', 'title',
+                   'input_title_line', 'input_var_line', 'table_type_code',
+                   'table_type_label', 'variables_json', 'variable_labels_json',
+                   'is_multi_response', 'is_mean', 'is_t2b', 'full_base_n',
+                   'full_base_status', 'routing_filter_description',
+                   'routing_filter_expression', 'routing_filter_source',
+                   'routing_filter_status'],
+        'OUTPUT_TABLES': ['output_id', 'sheet_name', 'sheet_role', 'table_idx',
+                          'table_number', 'title_rendered', 'start_row',
+                          'end_row', 'base_n', 'base_source',
+                          'effective_filter_description',
+                          'effective_filter_groups_json',
+                          'routing_filter_description',
+                          'routing_filter_expression', 'routing_filter_status',
+                          'base_frame',
+                          'banner_vars_json'],
+        'BANNERS': ['output_id', 'sheet_name', 'banner_order', 'banner_var',
+                    'banner_label', 'axis_id', 'segment_order', 'segment_code',
+                    'segment_label', 'segment_n', 'weight_col'],
+        'ROUTING': ['table_idx', 'table_number', 'q_code', 'title', 'base_n',
+                    'description', 'expression', 'source'],
+        'WARNINGS': ['level', 'code', 'table_idx', 'output_id', 'message'],
+    }
+
+    def __init__(self):
+        self.sections = {section: [] for section in self.SECTION_COLUMNS}
+
+    def add(self, section, **row):
+        if section not in self.sections:
+            raise KeyError(section)
+        self.sections[section].append(row)
+
+    def write_to_workbook(self, wb, sheet_name='_AI_META', hidden=True):
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+        row_num = 1
+
+        for section, columns in self.SECTION_COLUMNS.items():
+            rows = self.sections.get(section, [])
+            if not rows and section not in ('META', 'SHEETS', 'TABLES'):
+                continue
+
+            ws.cell(row=row_num, column=1, value=f'## {section}')
+            row_num += 1
+            for col_num, column_name in enumerate(columns, 1):
+                ws.cell(row=row_num, column=col_num, value=column_name)
+            row_num += 1
+
+            for section_row in rows:
+                for col_num, column_name in enumerate(columns, 1):
+                    ws.cell(
+                        row=row_num,
+                        column=col_num,
+                        value=_excel_cell_value(section_row.get(column_name, '')),
+                    )
+                row_num += 1
+            row_num += 1
+
+        for col_idx, width in enumerate((26, 28, 18, 45, 28, 28, 28, 18, 36, 36), 1):
+            ws.column_dimensions[chr(64 + col_idx)].width = width
+        ws.freeze_panes = 'A3'
+        if hidden:
+            ws.sheet_state = 'hidden'
+        return ws
+
+
+_TABLE_TYPE_LABELS = {
+    's': 'distribution',
+    'k': 'multi_response',
+    'd': 'multi_dichotomy',
+    'n': 'numeric_full',
+    'm': 'mean',
+    'f': 'frequency',
+}
+
+
+def _extract_q_code_from_title(title):
+    """Return the lexical question code from a table title without interpreting it."""
+    title = (title or '').strip()
+    match = re.match(r'^([A-Za-z]+\d+[A-Za-z]*(?:\.\d+)?|[A-Za-z]+)', title)
+    if not match:
+        return ''
+    return match.group(1).rstrip('.:').lower()
+
+
+def _routing_group_key_from_title(title):
+    title = (title or '').strip()
+    match = re.match(r'^([A-Za-z]+\d+[A-Za-z]*)(?:[_\.][A-Za-z]?\d+)?', title)
+    if match:
+        return match.group(1).lower()
+    return _extract_q_code_from_title(title)
+
+
+def _lookup_value_label(vlabels, value):
+    if not hasattr(vlabels, 'get'):
+        return ''
+    candidates = [value, str(value)]
+    try:
+        float_value = float(value)
+        candidates.append(float_value)
+        if float_value.is_integer():
+            candidates.append(int(float_value))
+    except (ValueError, TypeError):
+        pass
+    for candidate in candidates:
+        try:
+            label = vlabels.get(candidate, '')
+        except TypeError:
+            continue
+        if label:
+            return label
+    return ''
+
+
+def _labels_for_filter_values(filter_group, val_labels_dict):
+    values = filter_group.get('vals', [])
+    if filter_group.get('mode') == 'multi':
+        group_vars = filter_group.get('vars', [])
+        labels = []
+        for value in values:
+            label = ''
+            for group_var in group_vars:
+                label = _lookup_value_label(val_labels_dict.get(group_var, {}), value)
+                if label:
+                    break
+            labels.append(label or str(value))
+        return labels
+
+    var_name = filter_group.get('var', '')
+    vlabels = val_labels_dict.get(var_name, {})
+    return [_lookup_value_label(vlabels, value) or str(value) for value in values]
+
+
+def _label_or_var_name(labels_dict, var_name):
+    label = labels_dict.get(var_name)
+    if label is None:
+        return str(var_name)
+    try:
+        if pd.isna(label):
+            return str(var_name)
+    except (TypeError, ValueError):
+        pass
+    label = str(label).strip()
+    return label or str(var_name)
+
+
+def _add_filter_meta_rows(builder, scope, output_id, filter_groups,
+                          labels_dict, val_labels_dict):
+    for condition_order, filter_group in enumerate(filter_groups, 1):
+        mode = filter_group.get('mode', 'single')
+        var_name = filter_group.get('var', '') if mode != 'multi' else ''
+        group_vars = filter_group.get('vars', []) if mode == 'multi' else []
+        builder.add(
+            'FILTERS',
+            scope=scope,
+            output_id=output_id or '',
+            condition_order=condition_order,
+            logic_with_previous=filter_group.get('logic', 'AND'),
+            mode=mode,
+            var=var_name,
+            vars_json=_json_cell(group_vars),
+            group_label=filter_group.get('group_label', ''),
+            var_label=_label_or_var_name(labels_dict, var_name) if var_name else '',
+            value_codes_json=_json_cell(filter_group.get('vals', [])),
+            value_labels_json=_json_cell(_labels_for_filter_values(filter_group, val_labels_dict)),
+            description=build_filter_groups_description([filter_group], labels_dict, val_labels_dict),
+        )
+
+
+def _filter_description(filter_groups, labels_dict, val_labels_dict):
+    return build_filter_groups_description(filter_groups, labels_dict, val_labels_dict) if filter_groups else ''
+
+
+def _effective_filter_description(global_desc, output_desc):
+    if global_desc and output_desc:
+        return f'{global_desc} **I** {output_desc}'
+    return global_desc or output_desc or ''
+
+
+def _table_base_from_result(table):
+    rows = table.get('rows', [])
+    header = [str(h).strip().lower() for h in table.get('header', [])]
+    for data_row in rows:
+        if data_row and str(data_row[0]).strip().lower().startswith('total'):
+            for candidate in ('n', 'frequency'):
+                if candidate in header:
+                    value = data_row[header.index(candidate)]
+                    try:
+                        return float(value), 'total_row'
+                    except (TypeError, ValueError):
+                        return '', 'total_row'
+            if len(data_row) > 1:
+                try:
+                    return float(data_row[1]), 'total_row'
+                except (TypeError, ValueError):
+                    return '', 'total_row'
+
+    if 'n' in header:
+        n_idx = header.index('n')
+        n_values = []
+        for data_row in rows:
+            if len(data_row) > n_idx:
+                try:
+                    n_values.append(float(data_row[n_idx]))
+                except (TypeError, ValueError):
+                    pass
+        unique_values = sorted(set(n_values))
+        if len(unique_values) == 1:
+            return unique_values[0], 'numeric_n'
+    return '', 'not_applicable'
+
+
+def _table_base_frame(has_effective_filter, base_n, full_n, routing_known=False):
+    if has_effective_filter:
+        return 'output_filtered'
+    if base_n == '':
+        return 'not_applicable'
+    try:
+        if float(base_n) < float(full_n):
+            if routing_known:
+                return 'output_filtered'
+            return 'partial_unknown'
+    except (TypeError, ValueError):
+        pass
+    return 'full'
+
+
+def _output_routing_filter_status(routing_meta, base_frame):
+    if _routing_known(routing_meta):
+        return 'known'
+    if base_frame == 'partial_unknown':
+        return 'unknown_partial_base'
+    return 'not_filtered'
+
+
+def _estimate_definition_base(df, table_type, variables_resolved):
+    if not variables_resolved:
+        return '', 'unknown', 'not_filtered'
+    try:
+        if table_type in ('s', 'f'):
+            valid_n = int(df[variables_resolved[0]].notna().sum())
+        elif table_type in ('k', 'd'):
+            valid_n = int(df[variables_resolved].notna().any(axis=1).sum())
+        elif table_type in ('n', 'm'):
+            return '', 'not_applicable', 'not_filtered'
+        else:
+            return '', 'unknown', 'not_filtered'
+    except Exception:
+        return '', 'unknown', 'not_filtered'
+
+    if valid_n < len(df):
+        return valid_n, 'partial_base', 'unknown_partial_base'
+    return valid_n, 'full_sample', 'not_filtered'
+
+
+def _collect_ai_meta_plan():
+    study_fields = {
+        'project_name': _normalize_user_text(st.session_state.get('ai_meta_project_name', '')),
+        'study_type': _normalize_user_text(st.session_state.get('ai_meta_study_type', '')),
+        'methodology': _normalize_user_text(st.session_state.get('ai_meta_methodology', '')),
+        'fielding_period': _normalize_user_text(st.session_state.get('ai_meta_fielding_period', '')),
+        'client': _normalize_user_text(st.session_state.get('ai_meta_client', '')),
+        'product': _normalize_user_text(st.session_state.get('ai_meta_product', '')),
+    }
+    routing = {}
+    route_members = {}
+    for key, value in st.session_state.items():
+        member_match = re.match(r'ai_meta_route_members_(\d+)$', str(key))
+        if member_match:
+            route_members[member_match.group(1)] = [str(member_idx) for member_idx in (value or [])]
+            continue
+
+        match = re.match(r'ai_meta_route_(desc|expr)_(\d+)$', str(key))
+        if not match:
+            continue
+        field, table_idx = match.groups()
+        route = routing.setdefault(table_idx, {})
+        route['description' if field == 'desc' else 'expression'] = value
+
+    expanded_routing = {}
+    grouped_member_indices = {
+        str(member_idx)
+        for primary_idx, member_indices in route_members.items()
+        for member_idx in member_indices
+        if str(member_idx) != str(primary_idx)
+    }
+    for table_idx, route in routing.items():
+        if table_idx in grouped_member_indices:
+            continue
+        description = _normalize_user_text(route.get('description')).strip()
+        expression = _normalize_user_text(route.get('expression')).strip()
+        if not description and not expression:
+            continue
+        for member_idx in route_members.get(table_idx, [table_idx]):
+            expanded_routing[str(member_idx)] = {
+                'description': description,
+                'expression': expression,
+            }
+    routing = expanded_routing
+    return {'study': study_fields, 'routing': routing}
+
+
+def _apply_ai_meta_plan(ai_meta_plan):
+    if not ai_meta_plan:
+        return
+    for key in list(st.session_state.keys()):
+        if str(key).startswith('ai_meta_route_'):
+            st.session_state.pop(key, None)
+
+    study = ai_meta_plan.get('study', {})
+    for field in ('project_name', 'study_type', 'methodology', 'fielding_period', 'client', 'product'):
+        state_key = f'ai_meta_{field}'
+        st.session_state[state_key] = _normalize_user_text(study.get(field, ''))
+
+    for table_idx, route in ai_meta_plan.get('routing', {}).items():
+        desc_key = f'ai_meta_route_desc_{table_idx}'
+        expr_key = f'ai_meta_route_expr_{table_idx}'
+        st.session_state[desc_key] = _normalize_user_text(route.get('description', ''))
+        st.session_state[expr_key] = _normalize_user_text(route.get('expression', ''))
+
+
+def _routing_meta_for_table(ai_meta_settings, table_idx):
+    if not ai_meta_settings:
+        return {}
+    return ai_meta_settings.get('routing', {}).get(str(table_idx), {})
+
+
+def _routing_known(routing_meta):
+    return bool((routing_meta.get('description') or '').strip() or
+                (routing_meta.get('expression') or '').strip())
+
+
+def _partial_base_candidates(titles, variables, df, meta, start_num):
+    from collections import OrderedDict
+
+    labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
+    col_lc = {col.lower(): col for col in df.columns}
+    groups = OrderedDict()
+    for table_idx, (title_line, var_line) in enumerate(zip(titles, variables)):
+        table_type = get_table_type(title_line)
+        table_title = get_table_title(title_line)
+        raw_vars = _extract_vars_from_line(var_line)
+        variables_resolved = [col_lc[var.lower()] for var in raw_vars if var.lower() in col_lc]
+        full_base_n, full_base_status, _routing_status = _estimate_definition_base(
+            df, table_type, variables_resolved)
+        if full_base_status != 'partial_base':
+            continue
+        labels = [_label_or_var_name(labels_dict, var) for var in variables_resolved]
+        q_code = _routing_group_key_from_title(table_title)
+        group = groups.setdefault(q_code or f'table_{table_idx}', {
+            'table_idx': table_idx,
+            'table_indices': [],
+            'table_numbers': [],
+            'q_code': q_code,
+            'title': table_title,
+            'variables': [],
+            'variable_labels': [],
+        })
+        group['table_indices'].append(table_idx)
+        group['table_numbers'].append(f'{table_idx + start_num}.1')
+        for var_name, var_label in zip(variables_resolved, labels):
+            if var_name not in group['variables']:
+                group['variables'].append(var_name)
+                group['variable_labels'].append(var_label)
+
+    candidates = []
+    for group in groups.values():
+        group_vars = group['variables']
+        if group_vars:
+            base_n = int(df[group_vars].notna().any(axis=1).sum())
+        else:
+            base_n = ''
+        table_numbers = group['table_numbers']
+        group['table_number'] = table_numbers[0] if len(table_numbers) == 1 else f'{table_numbers[0]} - {table_numbers[-1]}'
+        group['base_n'] = base_n
+        candidates.append(group)
+    return candidates
+
+
+def _add_table_definition_meta(builder, titles, variables, df, meta, start_num,
+                               ai_meta_settings=None):
+    labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
+    col_lc = {col.lower(): col for col in df.columns}
+    for table_idx, (title_line, var_line) in enumerate(zip(titles, variables)):
+        table_type = get_table_type(title_line)
+        table_title = get_table_title(title_line)
+        raw_vars = _extract_vars_from_line(var_line)
+        variables_resolved = [col_lc[var.lower()] for var in raw_vars if var.lower() in col_lc]
+        variable_labels = [_label_or_var_name(labels_dict, var) for var in variables_resolved]
+        full_base_n, full_base_status, routing_status = _estimate_definition_base(
+            df, table_type, variables_resolved)
+        title_upper = table_title.upper()
+        routing_meta = _routing_meta_for_table(ai_meta_settings, table_idx)
+        routing_description = _normalize_user_text(routing_meta.get('description')).strip()
+        routing_expression = _normalize_user_text(routing_meta.get('expression')).strip()
+        if _routing_known(routing_meta):
+            routing_status = 'known'
+
+        builder.add(
+            'TABLES',
+            table_idx=table_idx,
+            table_number=f'{table_idx + start_num}.1',
+            q_code=_extract_q_code_from_title(table_title),
+            title=table_title,
+            input_title_line=title_line,
+            input_var_line=var_line,
+            table_type_code=table_type,
+            table_type_label=_TABLE_TYPE_LABELS.get(table_type, table_type),
+            variables_json=_json_cell(variables_resolved),
+            variable_labels_json=_json_cell(variable_labels),
+            is_multi_response=table_type in ('k', 'd'),
+            is_mean=table_type in ('n', 'm') or '- MEAN' in title_upper,
+            is_t2b='T2B' in title_upper,
+            full_base_n=full_base_n,
+            full_base_status=full_base_status,
+            routing_filter_description=routing_description,
+            routing_filter_expression=routing_expression,
+            routing_filter_source='user' if _routing_known(routing_meta) else '',
+            routing_filter_status=routing_status,
+        )
+        if _routing_known(routing_meta):
+            builder.add(
+                'ROUTING',
+                table_idx=table_idx,
+                table_number=f'{table_idx + start_num}.1',
+                q_code=_extract_q_code_from_title(table_title),
+                title=table_title,
+                base_n=full_base_n,
+                description=routing_description,
+                expression=routing_expression,
+                source='user',
+            )
+
+
+def _add_banner_meta_rows(builder, output_id, sheet_name, banner_vars, work_df,
+                          meta, weight_col):
+    val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
+    for banner_order, banner_var in enumerate(banner_vars, 1):
+        if banner_var not in work_df.columns:
+            builder.add(
+                'WARNINGS', level='warning', code='BANNER_VAR_MISSING',
+                table_idx='', output_id=output_id,
+                message=f'Banner variable does not exist: {banner_var}',
+            )
+            continue
+        banner_label = get_var_label(banner_var, meta)
+        if banner_label == banner_var:
+            builder.add(
+                'WARNINGS', level='warning', code='BANNER_LABEL_MISSING',
+                table_idx='', output_id=output_id,
+                message=f'Banner variable has no SAV label; falling back to variable name: {banner_var}',
+            )
+        value_labels = val_labels_dict.get(banner_var, {})
+        observed_values = sorted(
+            work_df[banner_var].dropna().unique(),
+            key=lambda value: (0, float(value)) if isinstance(value, (int, float, np.integer, np.floating)) else (1, str(value)),
+        )
+        for segment_order, segment_code in enumerate(observed_values, 1):
+            segment_label = _lookup_value_label(value_labels, segment_code) or str(segment_code)
+            segment_mask = work_df[banner_var] == segment_code
+            if weight_col and weight_col in work_df.columns:
+                segment_n = float(work_df.loc[segment_mask, weight_col].sum())
+            else:
+                segment_n = int(segment_mask.sum())
+            builder.add(
+                'BANNERS',
+                output_id=output_id,
+                sheet_name=sheet_name,
+                banner_order=banner_order,
+                banner_var=banner_var,
+                banner_label=banner_label,
+                axis_id=banner_var,
+                segment_order=segment_order,
+                segment_code=segment_code,
+                segment_label=segment_label,
+                segment_n=segment_n,
+                weight_col=weight_col or '',
+            )
+
+
 def collect_plan(output_defs, use_weight, weight_col, start_num,
                  global_filter_groups=None):
     """Build a JSON-serializable dict from the current configuration."""
@@ -870,6 +1420,8 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             'weight_col': weight_col,
             'start_num': int(start_num),
             'add_toc': bool(st.session_state.get('add_toc', False)),
+            'add_ai_meta': bool(st.session_state.get('add_ai_meta', False)),
+            'ai_meta': _collect_ai_meta_plan(),
             'filter_groups': global_filter_groups or [],
         },
         'outputs': [],
@@ -1141,6 +1693,8 @@ def _build_plan_from_spo(spo_results, titles, variables, df, cat_var_names,
             'weight_col': '',
             'start_num': 1,
             'add_toc': False,
+            'add_ai_meta': False,
+            'ai_meta': {'study': {}, 'routing': {}},
             'filter_groups': [],
         },
         'outputs': all_outputs,
@@ -1360,8 +1914,9 @@ def main():
         'out_name_dirty_', 'out_autoname_',
         'fg_logic_', 'fg_var_', 'fg_vals_', 'n_fg_',
         'gfg_logic_', 'gfg_var_', 'gfg_vals_',
+        'ai_meta_',
     )
-    _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'table_design',
+    _WIDGET_GLOBALS = ('use_weight', 'weight_idx', 'add_toc', 'add_ai_meta', 'table_design',
                        'n_outputs', '_out_order', 'global_filt', 'n_gfg')
 
     def _snapshot_widget_config():
@@ -1401,6 +1956,9 @@ def main():
             st.session_state.pop(f'gfg_var_{_fi}', None)
             st.session_state.pop(f'gfg_vals_{_fi}', None)
             st.session_state.pop(f'gfg_logic_{_fi}', None)
+        for _k in list(st.session_state.keys()):
+            if str(_k).startswith('ai_meta_route_'):
+                st.session_state.pop(_k, None)
         # Remember peak n_outputs for future invalidation
         st.session_state['_prev_n_outputs'] = _n_out
         # Also clean from snapshot
@@ -1409,7 +1967,8 @@ def main():
             for _k in list(snap.keys()):
                 if _k.startswith(('out_banner_', 'out_excl_', 'out_sel_',
                                   'fg_var_', 'fg_vals_', 'fg_logic_',
-                                  'gfg_var_', 'gfg_vals_', 'gfg_logic_')) or _k == 'weight_idx':
+                                  'gfg_var_', 'gfg_vals_', 'gfg_logic_',
+                                  'ai_meta_route_')) or _k == 'weight_idx':
                     del snap[_k]
 
     def _reset_data():
@@ -1438,7 +1997,11 @@ def main():
         # Reset global settings
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
+        st.session_state['add_ai_meta'] = False
         st.session_state['table_design'] = 'hendal'
+        for _k in list(st.session_state.keys()):
+            if str(_k).startswith('ai_meta_'):
+                st.session_state.pop(_k, None)
         # Reset global filter
         st.session_state['global_filt'] = False
         n_gfg_prev = st.session_state.get('n_gfg', 0)
@@ -1478,7 +2041,11 @@ def main():
         # widget cache is overridden on next render
         st.session_state['use_weight'] = False
         st.session_state['add_toc'] = False
+        st.session_state['add_ai_meta'] = False
         st.session_state['table_design'] = 'hendal'
+        for _k in list(st.session_state.keys()):
+            if str(_k).startswith('ai_meta_'):
+                st.session_state.pop(_k, None)
         st.session_state['global_filt'] = False
         st.session_state['n_outputs'] = 1
         st.session_state['_out_order'] = [0]
@@ -1744,6 +2311,8 @@ def main():
         _g = _pp.get('global', {})
         st.session_state['use_weight'] = _g.get('use_weight', False)
         st.session_state['add_toc'] = _g.get('add_toc', False)
+        st.session_state['add_ai_meta'] = _g.get('add_ai_meta', False)
+        _apply_ai_meta_plan(_g.get('ai_meta', {}))
         wc = _g.get('weight_col')
         if wc and wc in numeric_vars:
             st.session_state['weight_idx'] = numeric_vars.index(wc)
@@ -1783,6 +2352,65 @@ def main():
     st.subheader("📑 Table of Contents")
     add_toc = st.checkbox("Dodaj TOC sheet (BETA)", key="add_toc",
                           help="Dodaje početni sheet s popisom svih tablica i linkovima")
+    add_ai_meta = st.checkbox("Dodaj AI META sheet (skriven)", key="add_ai_meta",
+                              help="Dodaje skriveni _AI_META sheet za AI context exporter")
+
+    if add_ai_meta:
+        st.subheader("🤖 AI META")
+        meta_col1, meta_col2, meta_col3 = st.columns(3)
+        with meta_col1:
+            st.text_input("Naziv projekta", key="ai_meta_project_name")
+            st.text_input("Klijent", key="ai_meta_client")
+        with meta_col2:
+            st.text_input("Proizvod / brand", key="ai_meta_product")
+            st.text_input("Tip studije", key="ai_meta_study_type")
+        with meta_col3:
+            st.text_input("Terenski period", key="ai_meta_fielding_period")
+            st.text_area("Metodologija", key="ai_meta_methodology", height=88)
+
+        partial_candidates = _partial_base_candidates(titles, variables, df, meta, start_num)
+        with st.expander(f"Routing baze pitanja ({len(partial_candidates)})", expanded=bool(partial_candidates)):
+            if not partial_candidates:
+                st.caption("Nema pitanja s automatski detektiranom smanjenom bazom.")
+            for candidate in partial_candidates:
+                table_idx = candidate['table_idx']
+                desc_key = f"ai_meta_route_desc_{table_idx}"
+                expr_key = f"ai_meta_route_expr_{table_idx}"
+                member_key = f"ai_meta_route_members_{table_idx}"
+                st.session_state[member_key] = candidate.get('table_indices', [table_idx])
+                if not st.session_state.get(desc_key):
+                    for member_idx in candidate.get('table_indices', []):
+                        member_desc = st.session_state.get(f"ai_meta_route_desc_{member_idx}")
+                        if member_desc:
+                            st.session_state[desc_key] = member_desc
+                            break
+                if not st.session_state.get(expr_key):
+                    for member_idx in candidate.get('table_indices', []):
+                        member_expr = st.session_state.get(f"ai_meta_route_expr_{member_idx}")
+                        if member_expr:
+                            st.session_state[expr_key] = member_expr
+                            break
+                title_preview = candidate['title'][:100]
+                with st.container(border=True):
+                    st.markdown(f"**T{candidate['table_number']} · {candidate['q_code']} · N={candidate['base_n']}**")
+                    st.caption(title_preview)
+                    vars_text = ', '.join(candidate['variables'])
+                    labels_text = ', '.join(candidate['variable_labels'])
+                    if vars_text:
+                        st.caption(f"Varijable: {vars_text}")
+                    if labels_text and labels_text != vars_text:
+                        st.caption(f"Labele: {labels_text}")
+                    st.text_area(
+                        "Tko je odgovarao?",
+                        key=desc_key,
+                        height=80,
+                        placeholder="npr. Ispitanici koji su izrazili nižu namjeru kupnje za blagu varijantu",
+                    )
+                    st.text_input(
+                        "Logički izraz / referenca (opcionalno)",
+                        key=expr_key,
+                        placeholder="npr. q12a in (1, 2) ili vidi routing u upitniku",
+                    )
 
     st.subheader("🎨 Dizajn tablica")
     table_design = st.selectbox(
@@ -2630,6 +3258,8 @@ def main():
                     tbl = make_numeric_table(df, var_line, meta, col_map, tt == 'n', weight_col)
                 else:
                     continue
+                if tt in ('n', 'm') and not tbl.get('rows'):
+                    continue
                 tbl_df = pd.DataFrame(tbl['rows'], columns=tbl['header'])
                 st.caption(f"**T{i + start_num} [{tt}]** {tn[:70]}")
                 st.dataframe(tbl_df, use_container_width=True, hide_index=True, height=min(len(tbl_df) * 35 + 40, 300))
@@ -2669,7 +3299,40 @@ def main():
         wb = _Workbook()
         # Ukloni default sheet
         wb.remove(wb.active)  # type: ignore[arg-type]
-        existing_sheets = []
+        existing_sheets = ['_AI_META'] if add_ai_meta else []
+
+        ai_meta_settings = _collect_ai_meta_plan() if add_ai_meta else {'study': {}, 'routing': {}}
+        ai_meta = AiMetaBuilder() if add_ai_meta else None
+        if ai_meta is not None:
+            study_meta = ai_meta_settings.get('study', {})
+            ai_meta.add('META', key='meta_schema_version', value='1.1', source='app', notes='')
+            ai_meta.add('META', key='generated_at', value=datetime.now(timezone.utc).isoformat(), source='app', notes='')
+            ai_meta.add('META', key='app_name', value='Hendalice', source='app', notes='')
+            ai_meta.add('META', key='app_version', value='2.4', source='app', notes='')
+            ai_meta.add('META', key='source_sav_name', value=st.session_state.get('_sav_name', ''), source='sav', notes='')
+            ai_meta.add('META', key='source_input_name', value=st.session_state.get('_input_name', ''), source='input', notes='')
+            ai_meta.add('META', key='row_count_unfiltered', value=len(df), source='dataframe', notes='')
+            ai_meta.add('META', key='weight_enabled', value=bool(use_weight), source='app', notes='')
+            ai_meta.add('META', key='weight_col', value=weight_col or '', source='app', notes='')
+            ai_meta.add('META', key='start_num', value=start_num, source='app', notes='')
+            ai_meta.add('META', key='table_design', value=table_design, source='app', notes='')
+            _sav_stem = os.path.splitext(st.session_state.get('_sav_name', ''))[0]
+            _project_match = re.search(r'([a-z]+_\d{2}_\d{2}_\d{3})', _sav_stem, re.IGNORECASE)
+            ai_meta.add('META', key='project_code_inferred',
+                        value=_project_match.group(1).lower() if _project_match else '',
+                        source='filename' if _project_match else 'unknown', notes='')
+            for _study_key in ('project_name', 'study_type', 'methodology', 'fielding_period', 'client', 'product'):
+                _study_value = _normalize_user_text(study_meta.get(_study_key)).strip()
+                ai_meta.add(
+                    'META', key=_study_key, value=_study_value,
+                    source='user' if _study_value else 'unknown',
+                    notes='' if _study_value else 'not provided in AI META settings',
+                )
+
+            _add_table_definition_meta(ai_meta, titles, variables, df, meta, start_num,
+                                       ai_meta_settings=ai_meta_settings)
+            _add_filter_meta_rows(ai_meta, 'global', '', active_global_filter_groups,
+                                  labels_dict, val_labels_dict)
 
         total_tables = 0
         total_xt = 0
@@ -2734,6 +3397,7 @@ def main():
 
         n_out = len(output_defs)
         for out_i, out_def in enumerate(output_defs):
+            output_id = out_i + 1
             pct_base = int(10 + 80 * out_i / max(n_out, 1))
             progress.progress(pct_base, text=f"Output {out_i + 1}/{n_out}: {out_def['sheet_name']}...")
 
@@ -2741,8 +3405,16 @@ def main():
             work_df = df.copy()
             if active_global_filter_groups:
                 work_df = apply_filter_groups(work_df, active_global_filter_groups)
+            n_after_global_filter = len(work_df)
             if out_def['filter_groups']:
                 work_df = apply_filter_groups(work_df, out_def['filter_groups'])
+            n_after_effective_filter = len(work_df)
+            global_filter_desc = _filter_description(active_global_filter_groups, labels_dict, val_labels_dict)
+            output_filter_desc = _filter_description(out_def.get('filter_groups', []), labels_dict, val_labels_dict)
+            effective_filter_desc = _effective_filter_description(global_filter_desc, output_filter_desc)
+            if ai_meta is not None:
+                _add_filter_meta_rows(ai_meta, 'output', output_id, out_def.get('filter_groups', []),
+                                      labels_dict, val_labels_dict)
 
             # ── Unique sheet name ──
             def _unique_name(base):
@@ -2791,6 +3463,82 @@ def main():
                     for mc in _srcws.merged_cells.ranges:
                         _destws.merge_cells(str(mc))
 
+                    if ai_meta is not None:
+                        ai_meta.add(
+                            'SHEETS', sheet_name=sname, role='total',
+                            output_id=output_id, base_sheet_name='',
+                            table_block_count=len(tables), hidden=False,
+                        )
+                        ai_meta.add(
+                            'OUTPUTS',
+                            output_id=output_id,
+                            sheet_base_name=out_def['sheet_name'],
+                            output_type='total',
+                            actual_sheet_base=sname,
+                            actual_sheet_sig='',
+                            actual_sheet_sig_total='',
+                            selected_table_indices_json=_json_cell(out_def.get('table_indices', [])),
+                            selected_table_count=len(out_def.get('table_indices', [])),
+                            banner_vars_json=_json_cell([]),
+                            banner_labels_json=_json_cell([]),
+                            show_sig=False,
+                            show_sig_total=False,
+                            global_filter_description=global_filter_desc,
+                            output_filter_description=output_filter_desc,
+                            effective_filter_description=effective_filter_desc,
+                            filter_groups_json=_json_cell(out_def.get('filter_groups', [])),
+                            global_filter_groups_json=_json_cell(active_global_filter_groups),
+                            n_unfiltered=len(df),
+                            n_after_global_filter=n_after_global_filter,
+                            n_after_effective_filter=n_after_effective_filter,
+                            weight_col=weight_col or '',
+                        )
+
+                        _meta_row = 1
+                        for tbl in tables:
+                            _n_data = len(tbl['rows'])
+                            _has_caption = bool(tbl.get('caption', ''))
+                            _start_row = _meta_row
+                            _end_row = _start_row + 1 + 1 + _n_data + (1 if _has_caption else 0) - 1
+                            _base_n, _base_source = _table_base_from_result(tbl)
+                            _table_idx = tbl.get('_idx', '')
+                            _routing_meta = _routing_meta_for_table(ai_meta_settings, _table_idx) if _table_idx != '' else {}
+                            _base_frame = _table_base_frame(
+                                bool(active_global_filter_groups or out_def.get('filter_groups', [])),
+                                _base_n, len(df), routing_known=_routing_known(_routing_meta),
+                            )
+                            ai_meta.add(
+                                'OUTPUT_TABLES',
+                                output_id=output_id,
+                                sheet_name=sname,
+                                sheet_role='total',
+                                table_idx=_table_idx,
+                                table_number=f'{int(_table_idx) + start_num}.1' if _table_idx != '' else '',
+                                title_rendered=tbl.get('title', ''),
+                                start_row=_start_row,
+                                end_row=_end_row,
+                                base_n=_base_n,
+                                base_source=_base_source,
+                                effective_filter_description=effective_filter_desc,
+                                effective_filter_groups_json=_json_cell({
+                                    'global': active_global_filter_groups,
+                                    'output': out_def.get('filter_groups', []),
+                                }),
+                                routing_filter_description=_routing_meta.get('description', ''),
+                                routing_filter_expression=_routing_meta.get('expression', ''),
+                                routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
+                                base_frame=_base_frame,
+                                banner_vars_json=_json_cell([]),
+                            )
+                            if _base_frame == 'partial_unknown':
+                                ai_meta.add(
+                                    'WARNINGS', level='warning',
+                                    code='PARTIAL_BASE_UNKNOWN_FILTER',
+                                    table_idx=_table_idx, output_id=output_id,
+                                    message='Table base is lower than full sample and no explicit output/global filter is active.',
+                                )
+                            _meta_row += 1 + 1 + _n_data + (1 if _has_caption else 0) + 1
+
                     # ── TOC positions for total tables ──
                     if add_toc:
                         _toc_r = 1
@@ -2830,6 +3578,7 @@ def main():
 
                 # Sheet sa sig-om (ako show_sig=True)
                 ws_sig = None
+                sig_name = ''
                 if show_sig:
                     _sig_base = out_def['sheet_name'][:27] + '_sig'
                     sig_name = _unique_name(_sig_base)
@@ -2837,10 +3586,57 @@ def main():
 
                 # Sheet sa sig_total (ako show_sig_total=True)
                 ws_sig_total = None
+                sig_total_name = ''
                 if show_sig_total:
                     _sigt_base = out_def['sheet_name'][:21] + '_sig_total'
                     sig_total_name = _unique_name(_sigt_base)
                     ws_sig_total = wb.create_sheet(title=sig_total_name)
+
+                if ai_meta is not None:
+                    _banner_labels_json = _json_cell(_banner_labels or [])
+                    ai_meta.add(
+                        'SHEETS', sheet_name=ws_name, role='cross_base',
+                        output_id=output_id, base_sheet_name='',
+                        table_block_count=len(tbl_indices), hidden=False,
+                    )
+                    if ws_sig is not None:
+                        ai_meta.add(
+                            'SHEETS', sheet_name=sig_name, role='significance',
+                            output_id=output_id, base_sheet_name=ws_name,
+                            table_block_count=len(tbl_indices), hidden=False,
+                        )
+                    if ws_sig_total is not None:
+                        ai_meta.add(
+                            'SHEETS', sheet_name=sig_total_name, role='sig_total',
+                            output_id=output_id, base_sheet_name=ws_name,
+                            table_block_count=len(tbl_indices), hidden=False,
+                        )
+                    ai_meta.add(
+                        'OUTPUTS',
+                        output_id=output_id,
+                        sheet_base_name=out_def['sheet_name'],
+                        output_type='krizanje',
+                        actual_sheet_base=ws_name,
+                        actual_sheet_sig=sig_name,
+                        actual_sheet_sig_total=sig_total_name,
+                        selected_table_indices_json=_json_cell(tbl_indices),
+                        selected_table_count=len(tbl_indices),
+                        banner_vars_json=_json_cell(banner_vars),
+                        banner_labels_json=_banner_labels_json,
+                        show_sig=bool(show_sig),
+                        show_sig_total=bool(show_sig_total),
+                        global_filter_description=global_filter_desc,
+                        output_filter_description=output_filter_desc,
+                        effective_filter_description=effective_filter_desc,
+                        filter_groups_json=_json_cell(out_def.get('filter_groups', [])),
+                        global_filter_groups_json=_json_cell(active_global_filter_groups),
+                        n_unfiltered=len(df),
+                        n_after_global_filter=n_after_global_filter,
+                        n_after_effective_filter=n_after_effective_filter,
+                        weight_col=weight_col or '',
+                    )
+                    _add_banner_meta_rows(ai_meta, output_id, ws_name, banner_vars,
+                                          work_df, meta, weight_col)
 
                 current_row = 1
                 current_row_sig = 1
@@ -2884,6 +3680,8 @@ def main():
                                 xt = make_crosstab_numeric(
                                     work_df, var_line, break_var,
                                     meta, col_map, table_type == 'n', weight_col)
+                                if not xt.get('row_labels'):
+                                    continue
                             else:
                                 continue
                             crosstabs.append(xt)
@@ -2910,29 +3708,129 @@ def main():
                                 'sheet': sig_total_name, 'row': current_row_st, 'cat': 'kriz_sigT', 'kriz_idx': _ki})
 
                     # Write to plain sheet (no sig)
+                    _plain_start_row = current_row
                     current_row = write_banner_to_sheet(
                         ws, banner, title_str,
                         start_row=current_row, show_sig=False,
                         design=table_design,
                         banner_labels=_banner_labels)
+                    _plain_end_row = current_row - 1
+                    if ai_meta is not None:
+                        _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
+                        _base_frame = _table_base_frame(
+                            bool(active_global_filter_groups or out_def.get('filter_groups', [])),
+                            banner.get('total_n', ''), len(df), routing_known=_routing_known(_routing_meta),
+                        )
+                        ai_meta.add(
+                            'OUTPUT_TABLES',
+                            output_id=output_id,
+                            sheet_name=ws_name,
+                            sheet_role='cross_base',
+                            table_idx=ti,
+                            table_number=f'{table_num}.1',
+                            title_rendered=title_str,
+                            start_row=_plain_start_row,
+                            end_row=_plain_end_row,
+                            base_n=banner.get('total_n', ''),
+                            base_source='n_row',
+                            effective_filter_description=effective_filter_desc,
+                            effective_filter_groups_json=_json_cell({
+                                'global': active_global_filter_groups,
+                                'output': out_def.get('filter_groups', []),
+                            }),
+                            routing_filter_description=_routing_meta.get('description', ''),
+                            routing_filter_expression=_routing_meta.get('expression', ''),
+                            routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
+                            base_frame=_base_frame,
+                            banner_vars_json=_json_cell(banner_vars),
+                        )
+                        if _base_frame == 'partial_unknown':
+                            ai_meta.add(
+                                'WARNINGS', level='warning',
+                                code='PARTIAL_BASE_UNKNOWN_FILTER',
+                                table_idx=ti, output_id=output_id,
+                                message='Crosstab base is lower than full sample and no explicit output/global filter is active.',
+                            )
                     current_row += 2
 
                     # Write to sig sheet (with sig)
                     if ws_sig is not None:
+                        _sig_start_row = current_row_sig
                         current_row_sig = write_banner_to_sheet(
                             ws_sig, banner, title_str,
                             start_row=current_row_sig, show_sig=True,
                             design=table_design,
                             banner_labels=_banner_labels)
+                        _sig_end_row = current_row_sig - 1
+                        if ai_meta is not None:
+                            _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
+                            _base_frame = _table_base_frame(
+                                bool(active_global_filter_groups or out_def.get('filter_groups', [])),
+                                banner.get('total_n', ''), len(df), routing_known=_routing_known(_routing_meta),
+                            )
+                            ai_meta.add(
+                                'OUTPUT_TABLES',
+                                output_id=output_id,
+                                sheet_name=sig_name,
+                                sheet_role='significance',
+                                table_idx=ti,
+                                table_number=f'{table_num}.1',
+                                title_rendered=title_str,
+                                start_row=_sig_start_row,
+                                end_row=_sig_end_row,
+                                base_n=banner.get('total_n', ''),
+                                base_source='n_row',
+                                effective_filter_description=effective_filter_desc,
+                                effective_filter_groups_json=_json_cell({
+                                    'global': active_global_filter_groups,
+                                    'output': out_def.get('filter_groups', []),
+                                }),
+                                routing_filter_description=_routing_meta.get('description', ''),
+                                routing_filter_expression=_routing_meta.get('expression', ''),
+                                routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
+                                base_frame=_base_frame,
+                                banner_vars_json=_json_cell(banner_vars),
+                            )
                         current_row_sig += 2
 
                     # Write to sig_total sheet (sig on Total column)
                     if ws_sig_total is not None:
+                        _sigt_start_row = current_row_st
                         current_row_st = write_banner_to_sheet(
                             ws_sig_total, banner, title_str,
                             start_row=current_row_st, show_sig=True,
                             show_sig_total=True, design=table_design,
                             banner_labels=_banner_labels)
+                        _sigt_end_row = current_row_st - 1
+                        if ai_meta is not None:
+                            _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
+                            _base_frame = _table_base_frame(
+                                bool(active_global_filter_groups or out_def.get('filter_groups', [])),
+                                banner.get('total_n', ''), len(df), routing_known=_routing_known(_routing_meta),
+                            )
+                            ai_meta.add(
+                                'OUTPUT_TABLES',
+                                output_id=output_id,
+                                sheet_name=sig_total_name,
+                                sheet_role='sig_total',
+                                table_idx=ti,
+                                table_number=f'{table_num}.1',
+                                title_rendered=title_str,
+                                start_row=_sigt_start_row,
+                                end_row=_sigt_end_row,
+                                base_n=banner.get('total_n', ''),
+                                base_source='n_row',
+                                effective_filter_description=effective_filter_desc,
+                                effective_filter_groups_json=_json_cell({
+                                    'global': active_global_filter_groups,
+                                    'output': out_def.get('filter_groups', []),
+                                }),
+                                routing_filter_description=_routing_meta.get('description', ''),
+                                routing_filter_expression=_routing_meta.get('expression', ''),
+                                routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
+                                base_frame=_base_frame,
+                                banner_vars_json=_json_cell(banner_vars),
+                            )
                         current_row_st += 2
 
         # ── TOC sheet (question-centric) ──
@@ -3068,7 +3966,15 @@ def main():
             toc_ws.freeze_panes = 'C2'
 
         # Spremi workbook
-        if not wb.worksheets:
+        if ai_meta is not None:
+            ai_meta.add(
+                'SHEETS', sheet_name='_AI_META', role='ai_meta',
+                output_id='', base_sheet_name='', table_block_count=0,
+                hidden=True,
+            )
+            ai_meta.write_to_workbook(wb, sheet_name='_AI_META', hidden=True)
+
+        if not wb.worksheets or not any(ws.sheet_state == 'visible' for ws in wb.worksheets):
             wb.create_sheet("Sheet1")
         wb.save(tmp_path)
         wb.close()
