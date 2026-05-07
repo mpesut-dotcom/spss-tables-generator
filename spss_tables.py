@@ -113,6 +113,14 @@ def get_value_labels(var_name, meta):
     return val_labels.get(var_name, {})
 
 
+def _round_n(value):
+    """Round table N values to a whole number."""
+    number = float(value)
+    if number >= 0:
+        return int(np.floor(number + 0.5))
+    return int(np.ceil(number - 0.5))
+
+
 def merge_value_labels(var_names, meta):
     """Merge value labels from all variables — first var wins on conflicts."""
     merged = {}
@@ -219,9 +227,9 @@ def make_simple_table(df, var_name, meta, col_map, weight_col=None):
         lbl = label_for_value(val, val_labels) if val_labels else label_for_value(val, {})
         n = counts.get(val, 0)
         pct = round(float(n) / float(total_n) * 100, 5) if total_n > 0 else 0.0
-        rows.append((str(lbl), round(float(n), 1), pct))
+        rows.append((str(lbl), _round_n(n), pct))
 
-    rows.append(('Total', round(float(total_n), 1), 100.0))
+    rows.append(('Total', _round_n(total_n), 100.0))
 
     return {
         'header': ['', 'n', '%'],
@@ -275,7 +283,7 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
             else:
                 n = int(mask.sum())
             pct = round(float(n) / float(total_cases) * 100, 5) if total_cases > 0 else 0.0
-            rows.append((str(label), round(float(n), 1), pct))
+            rows.append((str(label), _round_n(n), pct))
     else:
         # MDGROUP ('d'): rows = variables, labels = variable labels
         for vname in var_names:
@@ -286,9 +294,9 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
             else:
                 n = int(mask.sum())
             pct = round(float(n) / float(total_cases) * 100, 5) if total_cases > 0 else 0.0
-            rows.append((str(label), round(float(n), 1), pct))
+            rows.append((str(label), _round_n(n), pct))
 
-    rows.append(('Total*', round(float(total_cases), 1), ''))
+    rows.append(('Total*', _round_n(total_cases), ''))
 
     return {
         'header': ['', 'n', '%'],
@@ -329,7 +337,7 @@ def make_numeric_table(df, var_string, meta, col_map, full_stats=True, weight_co
                 v = col.values
                 w_sum = w.sum()
                 w_mean = float(np.average(v, weights=w))
-                w_n = round(float(w_sum), 1)
+                w_n = _round_n(w_sum)
 
                 if full_stats:
                     w_var = float(np.average((v - w_mean) ** 2, weights=w))
@@ -392,9 +400,9 @@ def make_freq_table(df, var_name, meta, col_map, weight_col=None):
         n_val = float(n)
         pct = round(n_val / total_n * 100, 5) if total_n > 0 else 0.0
         cum_pct = round(cum_pct + pct, 5)
-        rows.append((str(lbl), round(n_val, 1), pct, cum_pct))
+        rows.append((str(lbl), _round_n(n_val), pct, cum_pct))
 
-    rows.append(('Total', round(total_n, 1), 100.0, 100.0))
+    rows.append(('Total', _round_n(total_n), 100.0, 100.0))
 
     return {
         'header': ['', 'Frequency', '%', 'Cum. %'],
@@ -842,7 +850,7 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
                     m, sd, n = 0, 0, 0
             row_means.append(round(m, 2))
             row_sds.append(round(sd, 2))
-            row_ns.append(round(n, 1) if use_weight else n)
+            row_ns.append(_round_n(n) if use_weight else n)
 
         # Total
         mask_total = vals.notna()
@@ -866,7 +874,7 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
                 m, sd, n = 0, 0, 0
         row_means.append(round(m, 2))
         row_sds.append(round(sd, 2))
-        row_ns.append(round(n, 1) if use_weight else n)
+        row_ns.append(_round_n(n) if use_weight else n)
 
         mean_matrix.append(row_means)
         sd_matrix.append(row_sds)
