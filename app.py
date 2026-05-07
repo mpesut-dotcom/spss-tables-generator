@@ -25,6 +25,7 @@ import pandas as pd
 import pyreadstat
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 # Importaj engine funkcije iz spss_tables.py
@@ -913,6 +914,7 @@ class AiMetaBuilder:
     """Collect and write parser-friendly metadata for AI context export."""
     SECTION_COLUMNS = {
         'META': ['key', 'value', 'source', 'notes'],
+        'STUDY_CONTEXT': ['key', 'value', 'source', 'client_facing', 'notes'],
         'SHEETS': ['sheet_name', 'role', 'output_id', 'base_sheet_name',
                    'table_block_count', 'hidden'],
         'OUTPUTS': ['output_id', 'sheet_base_name', 'output_type',
@@ -932,6 +934,9 @@ class AiMetaBuilder:
         'TABLES': ['table_idx', 'table_number', 'q_code', 'title',
                    'input_title_line', 'input_var_line', 'table_type_code',
                    'table_type_label', 'variables_json', 'variable_labels_json',
+                   'metric_type', 'result_level', 'answer_scale_json',
+                   'evidence_needed_rules_json', 'valid_comparisons_json',
+                   'invalid_comparisons_json', 'interpretation_limit_hints_json',
                    'is_multi_response', 'is_mean', 'is_t2b', 'full_base_n',
                    'full_base_status', 'routing_filter_description',
                    'routing_filter_expression', 'routing_filter_source',
@@ -950,7 +955,8 @@ class AiMetaBuilder:
                     'segment_label', 'segment_n', 'weight_col'],
         'ROUTING': ['table_idx', 'table_number', 'q_code', 'title', 'base_n',
                     'description', 'expression', 'source'],
-        'WARNINGS': ['level', 'code', 'table_idx', 'output_id', 'message'],
+        'WARNINGS': ['level', 'code', 'table_idx', 'output_id', 'message',
+                     'audience', 'client_exclude'],
     }
 
     def __init__(self):
@@ -989,7 +995,7 @@ class AiMetaBuilder:
             row_num += 1
 
         for col_idx, width in enumerate((26, 28, 18, 45, 28, 28, 28, 18, 36, 36), 1):
-            ws.column_dimensions[chr(64 + col_idx)].width = width
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
         ws.freeze_panes = 'A3'
         if hidden:
             ws.sheet_state = 'hidden'
@@ -1004,6 +1010,268 @@ _TABLE_TYPE_LABELS = {
     'm': 'mean',
     'f': 'frequency',
 }
+
+_AI_META_STUDY_FIELDS = (
+    'project_name', 'client', 'product', 'study_type', 'study_objective',
+    'research_topics', 'fielding_period', 'default_time_scope',
+    'default_geography', 'population', 'sample_design', 'sample_notes',
+    'sample_size_notes', 'data_collection_method', 'methodology_notes',
+    'weighting_notes', 'reporting_notes', 'methodology',
+)
+
+_AI_META_LEGACY_STUDY_FIELDS = (
+    'project_name', 'study_type', 'methodology', 'fielding_period', 'client', 'product'
+)
+
+_AI_META_STUDY_DEFAULTS = {
+    'default_geography': 'Hrvatska',
+}
+
+_AI_META_STUDY_NOTES = {
+    'population': 'WHO: target population/universe for client-facing methodology.',
+    'sample_notes': 'HOW: how the sample was constructed or controlled.',
+    'methodology_notes': 'WHAT: data collection and method details, separate from population/sample.',
+    'default_geography': 'Default geography used when question context has no narrower geography.',
+    'default_time_scope': 'Default time scope used when question context has no narrower wave/period.',
+    'weighting_notes': 'Client-readable weighting statement; never debug syntax.',
+}
+
+
+def _clean_inline_text(value):
+    text = _normalize_user_text(value).strip()
+    return re.sub(r'[ \t]+', ' ', text)
+
+
+def _clean_period_text(value):
+    text = _clean_inline_text(value)
+    text = re.sub(
+        r'\b([A-Za-zČĆŽŠĐčćžšđ]+),\s+(\d{4})(\.)?',
+        lambda match: f"{match.group(1)} {match.group(2)}{match.group(3) or ''}",
+        text,
+    )
+    return text
+
+
+def _clean_product_text(value):
+    text = _clean_inline_text(value)
+    return re.sub(r'^Op[cć]enita tema\s*[-:]\s*', '', text, flags=re.IGNORECASE)
+
+
+def _clean_study_type_text(value):
+    text = _clean_inline_text(value)
+    if re.search(r'\b(CAWI|CAPI|CATI|PAPI|computer assisted)\b', text, re.IGNORECASE) and ' - ' in text:
+        return text.split(' - ', 1)[0].strip()
+    return text
+
+
+def _detect_collection_method(*texts):
+    joined = ' '.join(_normalize_user_text(text) for text in texts if text)
+    modes = []
+    mode_labels = (
+        ('CAWI', 'CAWI online anketa'),
+        ('CAPI', 'CAPI osobni intervjui'),
+        ('CATI', 'CATI telefonsko anketiranje'),
+        ('PAPI', 'PAPI papirnata anketa'),
+    )
+    for code, label in mode_labels:
+        if re.search(rf'\b{code}\b', joined, re.IGNORECASE):
+            modes.append(label)
+    return '; '.join(modes)
+
+
+def _resolve_weighting_notes(study_meta, use_weight, weight_col):
+    user_notes = _normalize_user_text(study_meta.get('weighting_notes', '')).strip()
+    if user_notes:
+        return user_notes, 'user'
+    if use_weight and weight_col:
+        return f'Podaci su ponderirani varijablom {weight_col}.', 'app'
+    return 'Podaci nisu ponderirani.', 'app'
+
+
+def _resolve_study_context(study_meta, df=None, use_weight=False, weight_col=None):
+    raw = {field: _normalize_user_text(study_meta.get(field, '')) for field in _AI_META_STUDY_FIELDS}
+    fielding_period = _clean_period_text(raw.get('fielding_period'))
+    default_time_scope = _clean_period_text(raw.get('default_time_scope')) or fielding_period
+    methodology_notes = _normalize_user_text(raw.get('methodology_notes')).strip() or _normalize_user_text(raw.get('methodology')).strip()
+    data_collection_method = _clean_inline_text(raw.get('data_collection_method')) or _detect_collection_method(
+        raw.get('study_type'), raw.get('methodology'), methodology_notes)
+    weighting_notes, weighting_source = _resolve_weighting_notes(study_meta, use_weight, weight_col)
+
+    context = {
+        'project_name': _clean_inline_text(raw.get('project_name')),
+        'client': _clean_inline_text(raw.get('client')),
+        'product': _clean_product_text(raw.get('product')),
+        'study_type': _clean_study_type_text(raw.get('study_type')),
+        'study_objective': _normalize_user_text(raw.get('study_objective')).strip(),
+        'research_topics': _clean_inline_text(raw.get('research_topics')),
+        'fielding_period': fielding_period,
+        'default_time_scope': default_time_scope,
+        'default_geography': _clean_inline_text(raw.get('default_geography')) or _AI_META_STUDY_DEFAULTS['default_geography'],
+        'population': _normalize_user_text(raw.get('population')).strip(),
+        'sample_design': _normalize_user_text(raw.get('sample_design')).strip(),
+        'sample_notes': _normalize_user_text(raw.get('sample_notes')).strip(),
+        'sample_size_notes': _normalize_user_text(raw.get('sample_size_notes')).strip(),
+        'data_collection_method': data_collection_method,
+        'methodology_notes': methodology_notes,
+        'weighting_notes': weighting_notes,
+        'reporting_notes': _normalize_user_text(raw.get('reporting_notes')).strip(),
+        'sample_n': int(len(df)) if df is not None else '',
+        'weight_enabled': bool(use_weight),
+        'weight_col': weight_col or '',
+    }
+    if use_weight and weight_col and df is not None and weight_col in df.columns:
+        context['weighted_sample_n'] = round(float(df[weight_col].sum()), 1)
+    else:
+        context['weighted_sample_n'] = ''
+
+    context['methodology'] = _normalize_user_text(raw.get('methodology')).strip() or context['methodology_notes']
+
+    sources = {}
+    for key, value in context.items():
+        if key == 'weighting_notes':
+            sources[key] = weighting_source
+        elif key in ('sample_n', 'weight_enabled', 'weight_col', 'weighted_sample_n'):
+            sources[key] = 'app'
+        elif key == 'default_geography' and not _normalize_user_text(raw.get('default_geography')).strip():
+            sources[key] = 'app_default'
+        elif key == 'default_time_scope' and not _normalize_user_text(raw.get('default_time_scope')).strip() and fielding_period:
+            sources[key] = 'fielding_period'
+        elif key == 'data_collection_method' and not _normalize_user_text(raw.get('data_collection_method')).strip() and value:
+            sources[key] = 'inferred'
+        elif key == 'methodology_notes' and not _normalize_user_text(raw.get('methodology_notes')).strip() and value:
+            sources[key] = 'legacy_methodology'
+        else:
+            sources[key] = 'user' if value not in ('', None) else 'unknown'
+    return context, sources
+
+
+def _add_meta_kv(builder, key, value, source='app', notes=''):
+    builder.add('META', key=key, value=value, source=source, notes=notes)
+
+
+def _add_study_meta_rows(builder, study_meta, df, use_weight, weight_col):
+    study_context, sources = _resolve_study_context(study_meta, df, use_weight, weight_col)
+    for key, value in study_context.items():
+        source = sources.get(key, 'unknown')
+        notes = _AI_META_STUDY_NOTES.get(key, '')
+        if key in _AI_META_LEGACY_STUDY_FIELDS:
+            _add_meta_kv(builder, key, value, source=source, notes=notes)
+        _add_meta_kv(builder, f'study_context.{key}', value, source=source, notes=notes)
+        builder.add(
+            'STUDY_CONTEXT',
+            key=key,
+            value=value,
+            source=source,
+            client_facing=key not in ('weight_enabled', 'weight_col'),
+            notes=notes,
+        )
+    _add_meta_kv(
+        builder,
+        'study_context_json',
+        _json_cell(study_context),
+        source='app',
+        notes='Structured study context for downstream JSON exporter.',
+    )
+
+
+def _table_metric_type(table_type, table_title):
+    title_upper = (table_title or '').upper()
+    if table_type in ('n', 'm'):
+        return 'mean_score'
+    if table_type in ('k', 'd'):
+        return 'multi_response'
+    if 'T2B' in title_upper:
+        return 't2b'
+    if table_type == 'f':
+        return 'frequency'
+    return 'distribution'
+
+
+def _table_result_level(full_base_status):
+    if full_base_status == 'partial_base':
+        return 'filtered_sample'
+    if full_base_status == 'full_sample':
+        return 'full_sample'
+    if full_base_status == 'not_applicable':
+        return 'not_applicable'
+    return 'unknown'
+
+
+def _answer_scale_meta(metric_type, variables_resolved, val_labels_dict):
+    if metric_type == 'mean_score':
+        return {'kind': 'numeric', 'source': 'numeric_variables'}
+    values_by_label = []
+    seen = set()
+    for var_name in variables_resolved:
+        value_labels = val_labels_dict.get(var_name, {}) or {}
+        for code, label in sorted(
+            value_labels.items(),
+            key=lambda item: (0, float(item[0])) if isinstance(item[0], (int, float, np.integer, np.floating)) else (1, str(item[0])),
+        ):
+            label_text = _lookup_value_label(value_labels, code) or str(label)
+            key = (str(code), label_text)
+            if key not in seen:
+                seen.add(key)
+                values_by_label.append({'code': code, 'label': label_text})
+    return {'kind': 'categorical', 'values': values_by_label}
+
+
+def _table_evidence_needed_rules(metric_type):
+    rules = {
+        'total_answer': 'Use the total result and cite the available base N.',
+        'segment_answer': 'Use crosstab segments only when the requested banner exists and base is sufficient.',
+        'trend_answer': 'Use only comparable waves/time outputs that are present for this question.',
+        'significance_answer': 'Use significance sheets when present; otherwise describe differences as directional, not statistically significant.',
+    }
+    if metric_type == 't2b':
+        rules['total_answer'] = 'Use the aggregated T2B result; do not rebuild T2B from raw top-box rows unless no T2B table exists.'
+    elif metric_type == 'multi_response':
+        rules['total_answer'] = 'Use respondent-level incidence percentages; do not sum options because totals can exceed 100%.'
+        rules['segment_answer'] = 'Compare each option independently; do not rank by summed multi-response percentages.'
+    elif metric_type == 'mean_score':
+        rules['total_answer'] = 'Use mean score with N; do not interpret it as a percentage distribution.'
+        rules['significance_answer'] = 'Use mean-difference significance logic and compare means, not shares.'
+    return rules
+
+
+def _table_valid_comparisons(metric_type):
+    comparisons = ['total_result', 'available_segment_breakdowns']
+    if metric_type in ('distribution', 't2b', 'multi_response'):
+        comparisons.append('percentage_point_differences')
+    if metric_type == 'mean_score':
+        comparisons.append('mean_score_differences')
+    comparisons.append('available_wave_or_time_comparison')
+    return comparisons
+
+
+def _table_invalid_comparisons(metric_type, full_base_status):
+    comparisons = ['missing_wave_as_zero', 'unavailable_breakdown_as_zero']
+    if metric_type == 'multi_response':
+        comparisons.append('summing_multi_response_options_to_100_percent')
+    if metric_type == 'mean_score':
+        comparisons.append('treating_mean_as_percentage')
+    if full_base_status == 'partial_base':
+        comparisons.append('comparing_partial_base_to_full_sample_without_routing_context')
+    return comparisons
+
+
+def _table_interpretation_limit_hints(metric_type, full_base_status):
+    hints = []
+    if full_base_status == 'partial_base':
+        hints.append('Question has a reduced base; use routing_filter context before generalizing.')
+    if metric_type == 'multi_response':
+        hints.append('Multi-response percentages can exceed 100%; interpret options independently.')
+    if metric_type == 't2b':
+        hints.append('T2B is an aggregated positive/top category metric; avoid mixing with full distribution without saying so.')
+    if metric_type == 'mean_score':
+        hints.append('Mean scores need scale context; avoid percentage language.')
+    return hints
+
+
+def _add_ai_meta_warning(builder, **row):
+    row.setdefault('audience', 'internal')
+    row.setdefault('client_exclude', True)
+    builder.add('WARNINGS', **row)
 
 
 def _extract_q_code_from_title(title):
@@ -1187,12 +1455,8 @@ def _estimate_definition_base(df, table_type, variables_resolved):
 
 def _collect_ai_meta_plan():
     study_fields = {
-        'project_name': _normalize_user_text(st.session_state.get('ai_meta_project_name', '')),
-        'study_type': _normalize_user_text(st.session_state.get('ai_meta_study_type', '')),
-        'methodology': _normalize_user_text(st.session_state.get('ai_meta_methodology', '')),
-        'fielding_period': _normalize_user_text(st.session_state.get('ai_meta_fielding_period', '')),
-        'client': _normalize_user_text(st.session_state.get('ai_meta_client', '')),
-        'product': _normalize_user_text(st.session_state.get('ai_meta_product', '')),
+        field: _normalize_user_text(st.session_state.get(f'ai_meta_{field}', ''))
+        for field in _AI_META_STUDY_FIELDS
     }
     routing = {}
     route_members = {}
@@ -1240,7 +1504,7 @@ def _apply_ai_meta_plan(ai_meta_plan):
             st.session_state.pop(key, None)
 
     study = ai_meta_plan.get('study', {})
-    for field in ('project_name', 'study_type', 'methodology', 'fielding_period', 'client', 'product'):
+    for field in _AI_META_STUDY_FIELDS:
         state_key = f'ai_meta_{field}'
         st.session_state[state_key] = _normalize_user_text(study.get(field, ''))
 
@@ -1312,6 +1576,7 @@ def _partial_base_candidates(titles, variables, df, meta, start_num):
 def _add_table_definition_meta(builder, titles, variables, df, meta, start_num,
                                ai_meta_settings=None):
     labels_dict = getattr(meta, 'column_names_to_labels', {}) or {}
+    val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
     col_lc = {col.lower(): col for col in df.columns}
     for table_idx, (title_line, var_line) in enumerate(zip(titles, variables)):
         table_type = get_table_type(title_line)
@@ -1327,6 +1592,8 @@ def _add_table_definition_meta(builder, titles, variables, df, meta, start_num,
         routing_expression = _normalize_user_text(routing_meta.get('expression')).strip()
         if _routing_known(routing_meta):
             routing_status = 'known'
+        metric_type = _table_metric_type(table_type, table_title)
+        result_level = _table_result_level(full_base_status)
 
         builder.add(
             'TABLES',
@@ -1340,6 +1607,13 @@ def _add_table_definition_meta(builder, titles, variables, df, meta, start_num,
             table_type_label=_TABLE_TYPE_LABELS.get(table_type, table_type),
             variables_json=_json_cell(variables_resolved),
             variable_labels_json=_json_cell(variable_labels),
+            metric_type=metric_type,
+            result_level=result_level,
+            answer_scale_json=_json_cell(_answer_scale_meta(metric_type, variables_resolved, val_labels_dict)),
+            evidence_needed_rules_json=_json_cell(_table_evidence_needed_rules(metric_type)),
+            valid_comparisons_json=_json_cell(_table_valid_comparisons(metric_type)),
+            invalid_comparisons_json=_json_cell(_table_invalid_comparisons(metric_type, full_base_status)),
+            interpretation_limit_hints_json=_json_cell(_table_interpretation_limit_hints(metric_type, full_base_status)),
             is_multi_response=table_type in ('k', 'd'),
             is_mean=table_type in ('n', 'm') or '- MEAN' in title_upper,
             is_t2b='T2B' in title_upper,
@@ -1369,16 +1643,18 @@ def _add_banner_meta_rows(builder, output_id, sheet_name, banner_vars, work_df,
     val_labels_dict = getattr(meta, 'variable_value_labels', {}) or {}
     for banner_order, banner_var in enumerate(banner_vars, 1):
         if banner_var not in work_df.columns:
-            builder.add(
-                'WARNINGS', level='warning', code='BANNER_VAR_MISSING',
+            _add_ai_meta_warning(
+                builder,
+                level='warning', code='BANNER_VAR_MISSING',
                 table_idx='', output_id=output_id,
                 message=f'Banner variable does not exist: {banner_var}',
             )
             continue
         banner_label = get_var_label(banner_var, meta)
         if banner_label == banner_var:
-            builder.add(
-                'WARNINGS', level='warning', code='BANNER_LABEL_MISSING',
+            _add_ai_meta_warning(
+                builder,
+                level='warning', code='BANNER_LABEL_MISSING',
                 table_idx='', output_id=output_id,
                 message=f'Banner variable has no SAV label; falling back to variable name: {banner_var}',
             )
@@ -2357,16 +2633,83 @@ def main():
 
     if add_ai_meta:
         st.subheader("🤖 AI META")
-        meta_col1, meta_col2, meta_col3 = st.columns(3)
-        with meta_col1:
-            st.text_input("Naziv projekta", key="ai_meta_project_name")
-            st.text_input("Klijent", key="ai_meta_client")
-        with meta_col2:
-            st.text_input("Proizvod / brand", key="ai_meta_product")
-            st.text_input("Tip studije", key="ai_meta_study_type")
-        with meta_col3:
-            st.text_input("Terenski period", key="ai_meta_fielding_period")
-            st.text_area("Metodologija", key="ai_meta_methodology", height=88)
+        for _field, _default in _AI_META_STUDY_DEFAULTS.items():
+            _state_key = f'ai_meta_{_field}'
+            if not _normalize_user_text(st.session_state.get(_state_key, '')).strip():
+                st.session_state[_state_key] = _default
+
+        with st.expander("Kontekst istraživanja", expanded=True):
+            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            with meta_col1:
+                st.text_input("Naziv projekta", key="ai_meta_project_name")
+                st.text_input("Klijent / vlasnik", key="ai_meta_client",
+                              placeholder="npr. Hendal interno ili naziv klijenta")
+                st.text_input("Tema / brand / proizvod", key="ai_meta_product",
+                              placeholder="npr. Environmental, Social, and Governance")
+            with meta_col2:
+                st.text_input("Tip istraživanja", key="ai_meta_study_type",
+                              placeholder="npr. Kvantitativno istraživanje")
+                st.text_input("Glavne teme", key="ai_meta_research_topics",
+                              placeholder="npr. održivost, ESG, potrošačke navike")
+                st.text_input("Cilj istraživanja", key="ai_meta_study_objective",
+                              placeholder="npr. Praćenje stavova i ponašanja kroz valove")
+            with meta_col3:
+                st.text_input("Terenski period", key="ai_meta_fielding_period",
+                              placeholder="npr. Rujan 2023.; Rujan 2024.; Rujan 2025.")
+                st.text_input("Zadani vremenski obuhvat", key="ai_meta_default_time_scope",
+                              placeholder="npr. 2023.-2025. ili Rujan 2025.")
+                st.text_input("Geografija", key="ai_meta_default_geography",
+                              placeholder="npr. Hrvatska")
+
+        with st.expander("Uzorak i metodologija", expanded=True):
+            sample_col1, sample_col2 = st.columns(2)
+            with sample_col1:
+                st.text_area(
+                    "Populacija",
+                    key="ai_meta_population",
+                    height=76,
+                    placeholder="npr. Odrasle osobe 18-65 u Hrvatskoj, nacionalno reprezentativan uzorak",
+                )
+                st.text_area(
+                    "Konstrukcija uzorka",
+                    key="ai_meta_sample_notes",
+                    height=76,
+                    placeholder="npr. Stratificiran po regiji, dobi i spolu",
+                )
+                st.text_input(
+                    "Dizajn uzorka",
+                    key="ai_meta_sample_design",
+                    placeholder="npr. Nacionalno reprezentativan kvotni uzorak",
+                )
+            with sample_col2:
+                st.text_input(
+                    "Metoda prikupljanja",
+                    key="ai_meta_data_collection_method",
+                    placeholder="npr. CAWI online anketa; CAPI osobni intervjui",
+                )
+                st.text_area(
+                    "Metodološke napomene",
+                    key="ai_meta_methodology_notes",
+                    height=76,
+                    placeholder="npr. Kombinacija CAWI i CAPI prikupljanja; rezultati prikazani na totalu i segmentima",
+                )
+                st.text_area(
+                    "Napomena o ponderiranju",
+                    key="ai_meta_weighting_notes",
+                    height=76,
+                    placeholder="Automatski: Podaci nisu ponderirani. / Podaci su ponderirani varijablom ...",
+                )
+            st.text_area(
+                "Napomene za interpretaciju",
+                key="ai_meta_reporting_notes",
+                height=72,
+                placeholder="npr. Trendove koristiti samo za pitanja dostupna u usporedivim valovima",
+            )
+            st.text_input(
+                "Veličina uzorka / napomena",
+                key="ai_meta_sample_size_notes",
+                placeholder="npr. N=500 po valu; ukupno N=1505",
+            )
 
         partial_candidates = _partial_base_candidates(titles, variables, df, meta, start_num)
         with st.expander(f"Routing baze pitanja ({len(partial_candidates)})", expanded=bool(partial_candidates)):
@@ -3305,10 +3648,10 @@ def main():
         ai_meta = AiMetaBuilder() if add_ai_meta else None
         if ai_meta is not None:
             study_meta = ai_meta_settings.get('study', {})
-            ai_meta.add('META', key='meta_schema_version', value='1.1', source='app', notes='')
+            ai_meta.add('META', key='meta_schema_version', value='1.2', source='app', notes='')
             ai_meta.add('META', key='generated_at', value=datetime.now(timezone.utc).isoformat(), source='app', notes='')
             ai_meta.add('META', key='app_name', value='Hendalice', source='app', notes='')
-            ai_meta.add('META', key='app_version', value='2.4', source='app', notes='')
+            ai_meta.add('META', key='app_version', value='2.5', source='app', notes='')
             ai_meta.add('META', key='source_sav_name', value=st.session_state.get('_sav_name', ''), source='sav', notes='')
             ai_meta.add('META', key='source_input_name', value=st.session_state.get('_input_name', ''), source='input', notes='')
             ai_meta.add('META', key='row_count_unfiltered', value=len(df), source='dataframe', notes='')
@@ -3321,13 +3664,7 @@ def main():
             ai_meta.add('META', key='project_code_inferred',
                         value=_project_match.group(1).lower() if _project_match else '',
                         source='filename' if _project_match else 'unknown', notes='')
-            for _study_key in ('project_name', 'study_type', 'methodology', 'fielding_period', 'client', 'product'):
-                _study_value = _normalize_user_text(study_meta.get(_study_key)).strip()
-                ai_meta.add(
-                    'META', key=_study_key, value=_study_value,
-                    source='user' if _study_value else 'unknown',
-                    notes='' if _study_value else 'not provided in AI META settings',
-                )
+            _add_study_meta_rows(ai_meta, study_meta, df, use_weight, weight_col)
 
             _add_table_definition_meta(ai_meta, titles, variables, df, meta, start_num,
                                        ai_meta_settings=ai_meta_settings)
@@ -3531,8 +3868,9 @@ def main():
                                 banner_vars_json=_json_cell([]),
                             )
                             if _base_frame == 'partial_unknown':
-                                ai_meta.add(
-                                    'WARNINGS', level='warning',
+                                _add_ai_meta_warning(
+                                    ai_meta,
+                                    level='warning',
                                     code='PARTIAL_BASE_UNKNOWN_FILTER',
                                     table_idx=_table_idx, output_id=output_id,
                                     message='Table base is lower than full sample and no explicit output/global filter is active.',
@@ -3745,8 +4083,9 @@ def main():
                             banner_vars_json=_json_cell(banner_vars),
                         )
                         if _base_frame == 'partial_unknown':
-                            ai_meta.add(
-                                'WARNINGS', level='warning',
+                            _add_ai_meta_warning(
+                                ai_meta,
+                                level='warning',
                                 code='PARTIAL_BASE_UNKNOWN_FILTER',
                                 table_idx=ti, output_id=output_id,
                                 message='Crosstab base is lower than full sample and no explicit output/global filter is active.',
