@@ -411,12 +411,57 @@ def make_freq_table(df, var_name, meta, col_map, weight_col=None):
     }
 
 
+def _table_base_value(table):
+    rows = table.get('rows', []) if table else []
+    if not rows:
+        return 0.0
+
+    header = [str(h).strip().lower() for h in table.get('header', [])]
+    for data_row in rows:
+        if data_row and str(data_row[0]).strip().lower().startswith('total'):
+            for candidate in ('n', 'frequency'):
+                if candidate in header:
+                    try:
+                        return float(data_row[header.index(candidate)])
+                    except (TypeError, ValueError):
+                        return None
+            if len(data_row) > 1:
+                try:
+                    return float(data_row[1])
+                except (TypeError, ValueError):
+                    return None
+
+    if 'n' in header:
+        n_idx = header.index('n')
+        n_values = []
+        for data_row in rows:
+            if len(data_row) > n_idx:
+                try:
+                    n_values.append(float(data_row[n_idx]))
+                except (TypeError, ValueError):
+                    pass
+        if n_values:
+            return max(n_values)
+
+    return None
+
+
+def table_has_nonzero_base(table):
+    """Return False for generated table dicts whose displayed base is N=0."""
+    base_value = _table_base_value(table)
+    if base_value is None:
+        return bool(table and table.get('rows'))
+    return base_value > 0
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  EXCEL PISANJE
 # ═══════════════════════════════════════════════════════════════════
 
 def write_tables_to_excel(tables, output_path, design='hendal'):
     """Pise sve tablice u Excel fajl s formatiranjem."""
+    tables = [table for table in tables if table_has_nonzero_base(table)]
+
     wb = Workbook()
     ws = wb.active
     assert ws is not None
@@ -1567,6 +1612,10 @@ Potrebni paketi:
 
             if table_type in ('n', 'm') and not result.get('rows'):
                 print(f"  [{table_num:3d}] {table_type}: preskoceno - nema valjanih numeric podataka")
+                continue
+
+            if not table_has_nonzero_base(result):
+                print(f"  [{table_num:3d}] {table_type}: preskoceno - baza N=0")
                 continue
 
             result['title'] = title_str

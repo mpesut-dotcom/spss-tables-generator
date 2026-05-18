@@ -45,6 +45,7 @@ from spss_tables import (
     make_simple_table,
     merge_crosstabs_banner,
     parse_numeric_vars,
+    table_has_nonzero_base,
     write_banner_to_sheet,
     write_tables_to_excel,
 )
@@ -694,6 +695,8 @@ def generate_tables(df, meta, titles, variables, weight_col, start_num):
                 continue
 
             if table_type in ('n', 'm') and not result.get('rows'):
+                continue
+            if not table_has_nonzero_base(result):
                 continue
 
             result['title'] = title_str
@@ -1408,6 +1411,84 @@ def _table_base_from_result(table):
         if len(unique_values) == 1:
             return unique_values[0], 'numeric_n'
     return '', 'not_applicable'
+
+
+def _banner_has_nonzero_base(banner):
+    if not banner or not banner.get('row_labels'):
+        return False
+    try:
+        return float(banner.get('total_n', 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _var_line_contains_var(var_line, var_name):
+    target = str(var_name).strip().lower()
+    return target in {part.strip().lower() for part in str(var_line).split()}
+
+
+def _build_banner_table_entry(work_df, meta, col_map, titles, variables, table_idx,
+                              banner_vars, banner_labels_by_var, weight_col,
+                              start_num):
+    if table_idx >= len(titles) or table_idx >= len(variables):
+        return None, [f"Kriz T{table_idx + start_num}: indeks tablice izvan raspona"]
+
+    title_line = titles[table_idx]
+    var_line = variables[table_idx]
+    table_type = get_table_type(title_line)
+    table_title = get_table_title(title_line)
+    table_num = table_idx + start_num
+
+    crosstabs = []
+    active_banner_vars = []
+    active_banner_labels = []
+    errors = []
+
+    for break_var in banner_vars:
+        if table_type == 's' and var_line.strip().lower() == break_var.lower():
+            continue
+        if _var_line_contains_var(var_line, break_var):
+            continue
+
+        try:
+            if table_type == 's':
+                xt = make_crosstab_simple(
+                    work_df, var_line.strip(), break_var,
+                    meta, col_map, weight_col)
+            elif table_type in ('k', 'd'):
+                xt = make_crosstab_mr(
+                    work_df, var_line, break_var,
+                    meta, col_map, table_type, weight_col)
+            elif table_type in ('n', 'm'):
+                xt = make_crosstab_numeric(
+                    work_df, var_line, break_var,
+                    meta, col_map, table_type == 'n', weight_col)
+                if not xt.get('row_labels'):
+                    continue
+            else:
+                continue
+            crosstabs.append(xt)
+            active_banner_vars.append(break_var)
+            active_banner_labels.append(
+                banner_labels_by_var.get(break_var, get_var_label(break_var, meta)))
+        except Exception as e:
+            errors.append(f"Kriz T{table_num} × {break_var}: {e}")
+
+    if not crosstabs:
+        return None, errors
+
+    banner = merge_crosstabs_banner(crosstabs)
+    if not _banner_has_nonzero_base(banner):
+        return None, errors
+
+    return {
+        'table_idx': table_idx,
+        'table_num': table_num,
+        'title': table_title,
+        'banner': banner,
+        'banner_vars': active_banner_vars,
+        'banner_labels': active_banner_labels,
+    }, errors
 
 
 def _table_base_frame(has_effective_filter, base_n, full_n, routing_known=False):
@@ -3603,6 +3684,8 @@ def main():
                     continue
                 if tt in ('n', 'm') and not tbl.get('rows'):
                     continue
+                if not table_has_nonzero_base(tbl):
+                    continue
                 tbl_df = pd.DataFrame(tbl['rows'], columns=tbl['header'])
                 st.caption(f"**T{i + start_num} [{tt}]** {tn[:70]}")
                 st.dataframe(tbl_df, use_container_width=True, hide_index=True, height=min(len(tbl_df) * 35 + 40, 300))
@@ -3909,6 +3992,19 @@ def main():
                 _banner_labels = None
                 if meta and banner_vars:
                     _banner_labels = [get_var_label(_bv, meta) for _bv in banner_vars]
+                _banner_labels_by_var = dict(zip(banner_vars, _banner_labels or []))
+
+                banner_entries = []
+                for ti in tbl_indices:
+                    entry, entry_errors = _build_banner_table_entry(
+                        work_df, meta, col_map, titles, variables, ti,
+                        banner_vars, _banner_labels_by_var, weight_col, start_num)
+                    all_errors.extend(entry_errors)
+                    if entry is not None:
+                        banner_entries.append(entry)
+
+                if not banner_entries:
+                    continue
 
                 # Sheet bez sig-a (uvijek)
                 ws_name = _unique_name(out_def['sheet_name'])
@@ -3935,19 +4031,19 @@ def main():
                     ai_meta.add(
                         'SHEETS', sheet_name=ws_name, role='cross_base',
                         output_id=output_id, base_sheet_name='',
-                        table_block_count=len(tbl_indices), hidden=False,
+                        table_block_count=len(banner_entries), hidden=False,
                     )
                     if ws_sig is not None:
                         ai_meta.add(
                             'SHEETS', sheet_name=sig_name, role='significance',
                             output_id=output_id, base_sheet_name=ws_name,
-                            table_block_count=len(tbl_indices), hidden=False,
+                            table_block_count=len(banner_entries), hidden=False,
                         )
                     if ws_sig_total is not None:
                         ai_meta.add(
                             'SHEETS', sheet_name=sig_total_name, role='sig_total',
                             output_id=output_id, base_sheet_name=ws_name,
-                            table_block_count=len(tbl_indices), hidden=False,
+                            table_block_count=len(banner_entries), hidden=False,
                         )
                     ai_meta.add(
                         'OUTPUTS',
@@ -3989,50 +4085,15 @@ def main():
                         'sigT': sig_total_name if show_sig_total else None,
                     })
 
-                for ti in tbl_indices:
-                    title_line = titles[ti]
-                    var_line = variables[ti]  # type: ignore[index]
-                    table_type = get_table_type(title_line)
-                    table_title = get_table_title(title_line)
-                    table_num = ti + start_num
+                total_xt += len(banner_entries)
 
-                    # Per-table: compute crosstab for each banner var
-                    crosstabs = []
-                    for break_var in banner_vars:
-                        # Preskoči samo-križanje
-                        if table_type == 's' and var_line.strip().lower() == break_var.lower():
-                            continue
-                        if break_var.lower() in [v.strip().lower() for v in var_line.split()]:
-                            continue
-
-                        try:
-                            if table_type == 's':
-                                xt = make_crosstab_simple(
-                                    work_df, var_line.strip(), break_var,
-                                    meta, col_map, weight_col)
-                            elif table_type in ('k', 'd'):
-                                xt = make_crosstab_mr(
-                                    work_df, var_line, break_var,
-                                    meta, col_map, table_type, weight_col)
-                            elif table_type in ('n', 'm'):
-                                xt = make_crosstab_numeric(
-                                    work_df, var_line, break_var,
-                                    meta, col_map, table_type == 'n', weight_col)
-                                if not xt.get('row_labels'):
-                                    continue
-                            else:
-                                continue
-                            crosstabs.append(xt)
-                        except Exception as e:
-                            all_errors.append(f"Kriz T{table_num} × {break_var}: {e}")
-
-                    if not crosstabs:
-                        continue
-
-                    # Merge into banner
-                    banner = merge_crosstabs_banner(crosstabs)
-                    title_str = table_title
-                    total_xt += 1
+                for entry in banner_entries:
+                    ti = entry['table_idx']
+                    table_num = entry['table_num']
+                    banner = entry['banner']
+                    title_str = entry['title']
+                    _entry_banner_labels = entry['banner_labels']
+                    _entry_banner_vars = entry['banner_vars']
 
                     # ── TOC positions for krizanje table ──
                     if add_toc:
@@ -4051,7 +4112,7 @@ def main():
                         ws, banner, title_str,
                         start_row=current_row, show_sig=False,
                         design=table_design,
-                        banner_labels=_banner_labels)
+                        banner_labels=_entry_banner_labels)
                     _plain_end_row = current_row - 1
                     if ai_meta is not None:
                         _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
@@ -4080,7 +4141,7 @@ def main():
                             routing_filter_expression=_routing_meta.get('expression', ''),
                             routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
                             base_frame=_base_frame,
-                            banner_vars_json=_json_cell(banner_vars),
+                            banner_vars_json=_json_cell(_entry_banner_vars),
                         )
                         if _base_frame == 'partial_unknown':
                             _add_ai_meta_warning(
@@ -4099,7 +4160,7 @@ def main():
                             ws_sig, banner, title_str,
                             start_row=current_row_sig, show_sig=True,
                             design=table_design,
-                            banner_labels=_banner_labels)
+                            banner_labels=_entry_banner_labels)
                         _sig_end_row = current_row_sig - 1
                         if ai_meta is not None:
                             _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
@@ -4128,7 +4189,7 @@ def main():
                                 routing_filter_expression=_routing_meta.get('expression', ''),
                                 routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
                                 base_frame=_base_frame,
-                                banner_vars_json=_json_cell(banner_vars),
+                                banner_vars_json=_json_cell(_entry_banner_vars),
                             )
                         current_row_sig += 2
 
@@ -4139,7 +4200,7 @@ def main():
                             ws_sig_total, banner, title_str,
                             start_row=current_row_st, show_sig=True,
                             show_sig_total=True, design=table_design,
-                            banner_labels=_banner_labels)
+                            banner_labels=_entry_banner_labels)
                         _sigt_end_row = current_row_st - 1
                         if ai_meta is not None:
                             _routing_meta = _routing_meta_for_table(ai_meta_settings, ti)
@@ -4168,7 +4229,7 @@ def main():
                                 routing_filter_expression=_routing_meta.get('expression', ''),
                                 routing_filter_status=_output_routing_filter_status(_routing_meta, _base_frame),
                                 base_frame=_base_frame,
-                                banner_vars_json=_json_cell(banner_vars),
+                                banner_vars_json=_json_cell(_entry_banner_vars),
                             )
                         current_row_st += 2
 
