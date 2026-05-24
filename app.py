@@ -660,6 +660,56 @@ def build_variable_groups(titles, variables, df_columns):
     return groups
 
 
+def _is_banner_candidate(df, var_name):
+    if var_name not in df.columns:
+        return False
+    nunique = df[var_name].dropna().nunique()
+    return 2 <= nunique <= 30
+
+
+def _format_labeled_var(var_name, labels_dict):
+    label = labels_dict.get(var_name) or ''
+    return f"{var_name} — {label}" if label and label != var_name else var_name
+
+
+def build_banner_choices(titles, variables, df, labels_dict, start_num=1):
+    """Build banner choices with input-script variables first, then df-only vars."""
+    choices = []
+    seen_vars = set()
+    col_set_lc = {column.lower(): column for column in df.columns}
+
+    for table_idx, (title_line, var_line) in enumerate(zip(titles, variables)):
+        table_type = get_table_type(title_line)
+        if table_type not in ('s', 'k', 'd', 'n', 'm', 'f'):
+            continue
+
+        table_title = get_table_title(title_line)
+        for raw_var in _extract_vars_from_line(var_line):
+            var_name = col_set_lc.get(raw_var.lower())
+            if not var_name:
+                continue
+            var_key = var_name.lower()
+            if var_key in seen_vars or not _is_banner_candidate(df, var_name):
+                continue
+
+            seen_vars.add(var_key)
+            var_display = _format_labeled_var(var_name, labels_dict)
+            title_display = table_title[:70] if table_title else var_display
+            choices.append((
+                var_name,
+                f"T{table_idx + start_num} [{table_type}] {title_display} ({var_display})",
+            ))
+
+    for var_name in df.columns:
+        var_key = var_name.lower()
+        if var_key in seen_vars or not _is_banner_candidate(df, var_name):
+            continue
+        seen_vars.add(var_key)
+        choices.append((var_name, f"[df] {_format_labeled_var(var_name, labels_dict)}"))
+
+    return choices
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  GENERIRANJE TABLICA (engine wrapper)
 # ═══════════════════════════════════════════════════════════════════
@@ -2849,13 +2899,7 @@ def main():
     st.session_state['var_groups'] = var_groups
 
     # Kategoricke varijable za banner
-    cat_vars = []
-    for v in df.columns:
-        nunique = df[v].dropna().nunique()
-        if 2 <= nunique <= 30:
-            lbl = labels_dict.get(v) or ''
-            disp = f"{v} — {lbl}" if lbl and lbl != v else v
-            cat_vars.append((v, disp))
+    cat_vars = build_banner_choices(titles, variables, df, labels_dict, start_num)
     cat_var_names = [cv[0] for cv in cat_vars]
     cat_var_displays = [cv[1] for cv in cat_vars]
 
