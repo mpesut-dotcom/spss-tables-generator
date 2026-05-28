@@ -639,6 +639,46 @@ def _mean_sig(m1, m2, sd1, sd2, n1, n2):
     return abs(m1 - m2) / np.sqrt(denom)
 
 
+def _dependent_prop_z(pa_pct, pb_pct, n):
+    """
+    z-test za razliku dvaju postotaka iz ISTE multinomijalne baze (related/dependent).
+
+    Za single-response pitanje su opcije medjusobno iskljucive kategorije jednog
+    multinomijala na istoj bazi, pa je varijanca razlike:
+        var(pA - pB) = (pA + pB - (pA - pB)^2) / n
+    NE koristi se nezavisni two-proportion z-test (_col_pct_sig) koji vrijedi samo
+    za zasebne stupce (segmente) s razlicitim ispitanicima.
+
+    pa_pct, pb_pct su postoci (0-100), n je ponderirana (efektivna) baza.
+    Vraca |z| ili 0.0 ako test nije moguc (baza < 30 ili var <= 0).
+    """
+    if n is None or n < 30:
+        return 0.0
+    pa = pa_pct / 100.0
+    pb = pb_pct / 100.0
+    d = pa - pb
+    var = (pa + pb - d * d) / n
+    if var <= 0:
+        return 0.0
+    return abs(d) / np.sqrt(var)
+
+
+def _mcnemar_z(b, c):
+    """
+    McNemar z (normalna aproksimacija s korekcijom kontinuiteta) za zavisne
+    (multi-response) opcije. b i c su ponderirani diskordantni parovi:
+        b = izabrao A ali ne B,  c = izabrao B ali ne A
+    Vraca |z| ili 0.0 ako nema diskordantnih parova.
+    """
+    nd = b + c
+    if nd <= 0:
+        return 0.0
+    num = abs(b - c) - 1.0
+    if num < 0:
+        num = 0.0
+    return num / np.sqrt(nd)
+
+
 def make_crosstab_simple(df, var_name, break_var, meta, col_map, weight_col=None):
     """
     Krizanje za tip 's': pitanje BY break_var.
@@ -983,6 +1023,260 @@ def _compute_sig_pct(pct_matrix, col_ns, col_letters, num_break):
             sig_row.append(letters)
         sig_matrix.append(sig_row)
     return sig_matrix
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ZNACAJNOST IZMEDJU OPCIJA (BETWEEN-OPTIONS, red-vs-red, Total baza)
+# ═══════════════════════════════════════════════════════════════════
+
+def _between_single_options(table_result):
+    """[(label, pct)] za single-response tablicu, bez Total reda."""
+    options = []
+    for row in table_result.get('rows', []) or []:
+        if not row:
+            continue
+        label = str(row[0])
+        if label.strip().lower().startswith('total'):
+            continue
+        if len(row) < 3:
+            continue
+        try:
+            pct = float(row[2])
+        except (TypeError, ValueError):
+            continue
+        options.append((label, pct))
+    return options
+
+
+def _between_mr_option_masks(df, var_names, mr_type, meta):
+    """
+    Ordered [(label, mask)] za MR opcije — isti redoslijed i logika kao make_mr_table,
+    tako da se respondent-level maske poklapaju s prikazanim redovima tablice.
+    """
+    options = []
+    if mr_type == 'k':
+        all_vals = set()
+        for vname in var_names:
+            all_vals.update(df[vname].dropna().unique())
+        all_vals.discard(0)
+        all_vals = sorted(
+            all_vals,
+            key=lambda x: (0, float(x)) if isinstance(x, (int, float)) else (1, str(x)),
+        )
+        vlabels = merge_value_labels(var_names, meta)
+        for val in all_vals:
+            label = label_for_value(val, vlabels)
+            mask = pd.Series(False, index=df.index)
+            for vname in var_names:
+                mask = mask | (df[vname] == val)
+            options.append((str(label), mask))
+    else:  # 'd' — svaka varijabla je jedna opcija
+        for vname in var_names:
+            label = get_var_label(vname, meta)
+            mask = df[vname].notna() & (df[vname] != 0)
+            options.append((str(label), mask))
+    return options
+
+
+def compute_between_options(df, table_type, var_string, table_result, meta, col_map,
+                            weight_col=None, confidence=0.95):
+    """
+    Znacajnost razlike IZMEDJU OPCIJA (red-vs-red) jednog pitanja, na Total bazi.
+
+    Pravilan test ovisi o tipu pitanja:
+      - single-response ('s','f'): dependent/related-proportions test (_dependent_prop_z)
+      - multi-response  ('k','d'): McNemar na sirovim ponderiranim joint countovima
+      - numeric ('n','m'): preskace se (usporedba sredina je zaseban test) -> []
+
+    Koristi istu konvenciju kao postojeci sig (95% / SIG_LEVEL, ponderirana baza = suma
+    pondera, guard n<30). Vraca listu dictova (svi parovi opcija):
+      option_a_label, option_a_value, option_b_label, option_b_value, n,
+      significant, direction ('a_higher'|'b_higher'|'ns'),
+      test ('dependent_proportions'|'mcnemar'|'not_tested'),
+      confidence, z, b_a_not_b, c_b_not_a, note
+    """
+    results = []
+    if table_type in ('n', 'm'):
+        return results
+
+    base_n_raw = _table_base_value(table_result)
+    try:
+        base_n = float(base_n_raw) if base_n_raw is not None else 0.0
+    except (TypeError, ValueError):
+        base_n = 0.0
+
+    def _emit(la, pa, lb, pb, test, z, bcount, ccount, note):
+        significant = test in ('dependent_proportions', 'mcnemar') and z >= SIG_LEVEL
+        direction = 'ns'
+        if significant:
+            direction = 'a_higher' if pa > pb else 'b_higher'
+        results.append({
+            'option_a_label': la, 'option_a_value': round(pa, 1),
+            'option_b_label': lb, 'option_b_value': round(pb, 1),
+            'n': _round_n(base_n), 'significant': bool(significant),
+            'direction': direction, 'test': test,
+            'confidence': confidence, 'z': round(float(z), 3),
+            'b_a_not_b': _round_n(bcount) if bcount is not None else '',
+            'c_b_not_a': _round_n(ccount) if ccount is not None else '',
+            'note': note,
+        })
+
+    if table_type in ('k', 'd'):
+        var_names_raw = parse_mr_vars(var_string)
+        try:
+            var_names = [resolve_col(v, df, col_map) for v in var_names_raw]
+        except KeyError:
+            return results
+        use_weight = bool(weight_col) and weight_col in df.columns
+        option_masks = _between_mr_option_masks(df, var_names, table_type, meta)
+
+        opt_data = []
+        for label, mask in option_masks:
+            if use_weight:
+                n_sel = float(df.loc[mask, weight_col].sum())
+            else:
+                n_sel = float(int(mask.sum()))
+            pct = round(n_sel / base_n * 100, 5) if base_n > 0 else 0.0
+            opt_data.append((label, pct, mask))
+
+        for i in range(len(opt_data)):
+            for j in range(i + 1, len(opt_data)):
+                la, pa, ma = opt_data[i]
+                lb, pb, mb = opt_data[j]
+                a_not_b = ma & (~mb)
+                b_not_a = mb & (~ma)
+                if use_weight:
+                    bcount = float(df.loc[a_not_b, weight_col].sum())
+                    ccount = float(df.loc[b_not_a, weight_col].sum())
+                else:
+                    bcount = float(int(a_not_b.sum()))
+                    ccount = float(int(b_not_a.sum()))
+                if base_n < 30:
+                    _emit(la, pa, lb, pb, 'not_tested', 0.0, bcount, ccount, 'base_below_30')
+                    continue
+                z = _mcnemar_z(bcount, ccount)
+                note = 'few_discordant_pairs' if (bcount + ccount) < 10 else ''
+                _emit(la, pa, lb, pb, 'mcnemar', z, bcount, ccount, note)
+        return results
+
+    # single-response ('s','f')
+    options = _between_single_options(table_result)
+    for i in range(len(options)):
+        for j in range(i + 1, len(options)):
+            la, pa = options[i]
+            lb, pb = options[j]
+            if base_n < 30:
+                _emit(la, pa, lb, pb, 'not_tested', 0.0, None, None, 'base_below_30')
+                continue
+            z = _dependent_prop_z(pa, pb, base_n)
+            _emit(la, pa, lb, pb, 'dependent_proportions', z, None, None, '')
+    return results
+
+
+def write_between_options_sheet(wb, sheet_name, blocks, design='hendal'):
+    """
+    Pise dedicirani sheet sa znacajnoscu izmedju opcija (Total baza).
+    blocks: list of {'title','q_code','table_type','results':[pair dict, ...]}.
+    Vraca worksheet, ili None ako nema rezultata.
+    """
+    blocks = [b for b in blocks if b.get('results')]
+    if not blocks:
+        return None
+
+    ws = wb.create_sheet(title=sheet_name)
+    t = _get_theme(design)
+    _fn = t['font']
+    title_font = Font(name=_fn, size=11, bold=True, color=t['title_color'])
+    header_font = Font(name=_fn, size=10, bold=True, color=t.get('header_color', t['title_color']))
+    data_font = Font(name=_fn, size=10, color=t['data_color'])
+    sig_font = Font(name=_fn, size=10, bold=True, color=t['data_color'])
+    caption_font = Font(name=_fn, size=9, italic=True, color=t['caption_color'])
+    header_fill = PatternFill(start_color=t['header_fill'], end_color=t['header_fill'], fill_type='solid')
+    sig_fill = PatternFill(start_color=t['sig_fill'], end_color=t['sig_fill'], fill_type='solid')
+    even_fill = PatternFill(start_color=t['even_fill'], end_color=t['even_fill'], fill_type='solid')
+    _line = Side(style='thin', color=t['line_color'])
+    row_border = Border(bottom=_line)
+    header_border = Border(bottom=Side(style='medium', color=t['strong_color']))
+
+    header = ['Opcija A', '% A', 'Opcija B', '% B', 'N', 'Razlika (pp)',
+              'A¬B', 'B¬A', 'Test', 'Značajno (95%)', 'Viša opcija', 'Napomena']
+    int_cols = {5, 7, 8}
+    float_cols = {2, 4, 6}
+    right_cols = {2, 4, 5, 6, 7, 8}
+    sig_col = 10
+
+    col_widths = {}
+    row_num = 1
+    for block in blocks:
+        title = block.get('title', '') or block.get('q_code', '')
+        cell = ws.cell(row=row_num, column=1, value=f"{title} — značajnost između opcija (95%)")
+        cell.font = title_font
+        cell.alignment = Alignment(vertical='center')
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=len(header))
+        _track_width(col_widths, 1, title)
+        row_num += 1
+
+        for col_idx, h in enumerate(header, 1):
+            cell = ws.cell(row=row_num, column=col_idx, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = header_border
+            cell.alignment = Alignment(horizontal='center' if col_idx > 1 else 'left', vertical='center')
+            _track_width(col_widths, col_idx, h)
+        row_num += 1
+
+        for i, pair in enumerate(block['results']):
+            diff = round(pair['option_a_value'] - pair['option_b_value'], 1)
+            higher = ''
+            if pair['direction'] == 'a_higher':
+                higher = pair['option_a_label']
+            elif pair['direction'] == 'b_higher':
+                higher = pair['option_b_label']
+            values = [
+                pair['option_a_label'], pair['option_a_value'],
+                pair['option_b_label'], pair['option_b_value'],
+                pair['n'], diff,
+                pair.get('b_a_not_b', ''), pair.get('c_b_not_a', ''),
+                pair['test'], 'DA' if pair['significant'] else 'ne',
+                higher, pair.get('note', ''),
+            ]
+            is_even = (i % 2 == 1) and not pair['significant']
+            for col_idx, val in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col_idx)
+                if val is None or val == '':
+                    cell.value = ''
+                elif col_idx in float_cols and isinstance(val, (int, float)):
+                    cell.value = float(val)
+                    cell.number_format = '0.0'
+                elif col_idx in int_cols and isinstance(val, (int, float, np.integer)):
+                    cell.value = int(val)
+                    cell.number_format = '#,##0'
+                else:
+                    cell.value = str(val)
+                cell.font = sig_font if (col_idx == sig_col and pair['significant']) else data_font
+                cell.border = row_border
+                if pair['significant']:
+                    cell.fill = sig_fill
+                elif is_even:
+                    cell.fill = even_fill
+                if col_idx > 1:
+                    cell.alignment = Alignment(horizontal='right' if col_idx in right_cols else 'center')
+                _track_width(col_widths, col_idx, val)
+            row_num += 1
+
+        cell = ws.cell(
+            row=row_num, column=1,
+            value=("dependent_proportions = single-response (zavisni udjeli, ista baza); "
+                   "mcnemar = multi-response (ponderirani joint countovi A¬B / B¬A); "
+                   "not_tested = baza < 30 ili nedostaju joint podaci. Test: z-test 95%."),
+        )
+        cell.font = caption_font
+        row_num += 2
+
+    for col_idx, width in col_widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 3, 60)
+    ws.freeze_panes = 'A1'
+    return ws
 
 
 # ═══════════════════════════════════════════════════════════════════

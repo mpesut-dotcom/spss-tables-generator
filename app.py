@@ -32,6 +32,7 @@ from openpyxl.utils import get_column_letter
 from spo_parser import parse_spo, sav_names_match, parse_filter_expression, match_spo_to_input
 from spss_tables import (
     build_column_map,
+    compute_between_options,
     compute_sig_total_banner,
     get_table_title,
     get_table_type,
@@ -47,6 +48,7 @@ from spss_tables import (
     parse_numeric_vars,
     table_has_nonzero_base,
     write_banner_to_sheet,
+    write_between_options_sheet,
     write_tables_to_excel,
 )
 
@@ -1006,6 +1008,13 @@ class AiMetaBuilder:
         'BANNERS': ['output_id', 'sheet_name', 'banner_order', 'banner_var',
                     'banner_label', 'axis_id', 'segment_order', 'segment_code',
                     'segment_label', 'segment_n', 'weight_col'],
+        'BETWEEN_OPTIONS': ['output_id', 'source_sheet', 'between_sheet',
+                            'table_idx', 'table_number', 'q_code', 'title',
+                            'table_type_code', 'metric_type', 'scope', 'axis',
+                            'base_n', 'option_a_label', 'option_a_value',
+                            'option_b_label', 'option_b_value', 'significant',
+                            'direction', 'test', 'confidence', 'b_a_not_b',
+                            'c_b_not_a', 'note'],
         'ROUTING': ['table_idx', 'table_number', 'q_code', 'title', 'base_n',
                     'description', 'expression', 'source'],
         'WARNINGS': ['level', 'code', 'table_idx', 'output_id', 'message',
@@ -1845,6 +1854,8 @@ def collect_plan(output_defs, use_weight, weight_col, start_num,
             out['banner_vars'] = od.get('banner_vars', [])
             out['show_sig'] = od.get('show_sig', False)
             out['show_sig_total'] = od.get('show_sig_total', False)
+        if od['type'] == 'total':
+            out['show_between_options'] = od.get('show_between_options', True)
         plan['outputs'].append(out)
     return plan
 
@@ -2205,6 +2216,8 @@ def _apply_plan_outputs(plan, cat_var_names, filter_choices,
             st.session_state[f'out_banner_{oi}'] = banner_idx
             st.session_state[f'out_sig_{oi}'] = out.get('show_sig', True)
             st.session_state[f'out_sigtot_{oi}'] = out.get('show_sig_total', False)
+        if out.get('type') == 'total':
+            st.session_state[f'out_btw_{oi}'] = out.get('show_between_options', True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2317,7 +2330,7 @@ def main():
     # restore them once both files are loaded again.
     _WIDGET_PREFIXES = (
         'out_type_', 'out_name_', 'out_filt_', 'out_banner_',
-        'out_sig_', 'out_sigtot_', 'out_tblmode_', 'out_excl_', 'out_sel_',
+        'out_sig_', 'out_sigtot_', 'out_btw_', 'out_tblmode_', 'out_excl_', 'out_sel_',
         'out_name_dirty_', 'out_autoname_',
         'fg_logic_', 'fg_var_', 'fg_vals_', 'n_fg_',
         'gfg_logic_', 'gfg_var_', 'gfg_vals_',
@@ -2424,6 +2437,7 @@ def main():
             st.session_state[f'out_type_{oi}'] = 'total'
             st.session_state[f'out_filt_{oi}'] = False
             st.session_state.pop(f'out_sig_{oi}', None)
+            st.session_state.pop(f'out_btw_{oi}', None)
             st.session_state[f'out_sigtot_{oi}'] = False
             st.session_state[f'out_banner_{oi}'] = []
             st.session_state[f'out_name_dirty_{oi}'] = False
@@ -2461,6 +2475,7 @@ def main():
             st.session_state[f'out_type_{oi}'] = 'total'
             st.session_state[f'out_filt_{oi}'] = False
             st.session_state.pop(f'out_sig_{oi}', None)
+            st.session_state.pop(f'out_btw_{oi}', None)
             st.session_state[f'out_sigtot_{oi}'] = False
             st.session_state[f'out_banner_{oi}'] = []
             st.session_state[f'out_name_dirty_{oi}'] = False
@@ -3194,7 +3209,7 @@ def main():
         n = st.session_state.get('n_outputs', 1)
         for oi in range(n):
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}', 'out_btw_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
                 k = key_tpl.format(oi)
@@ -3251,7 +3266,7 @@ def main():
         for old_idx in remaining_sorted:
             new_idx = remap[old_idx]
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}', 'out_btw_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
                 k = key_tpl.format(old_idx)
@@ -3266,7 +3281,7 @@ def main():
         # Clear all output keys
         for oi in range(n):
             for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                            'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}', 'out_btw_{}',
                             'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                             'n_fg_{}', 'out_name_dirty_{}', 'out_autoname_{}'):
                 st.session_state.pop(key_tpl.format(oi), None)
@@ -3295,7 +3310,7 @@ def main():
 
         # Keys that are directly per-output
         for key_tpl in ('out_type_{}', 'out_name_{}', 'out_filt_{}',
-                        'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}',
+                        'out_banner_{}', 'out_sig_{}', 'out_sigtot_{}', 'out_btw_{}',
                         'out_tblmode_{}', 'out_excl_{}', 'out_sel_{}',
                         'n_fg_{}'):
             k_src = key_tpl.format(src)
@@ -3571,6 +3586,7 @@ def main():
             banner_vars_sel = []
             show_sig = False
             show_sig_total = False
+            show_between_options = False
             tbl_final_indices = list(all_tbl_indices)
 
             if out_type == 'krizanje':
@@ -3616,6 +3632,17 @@ def main():
                                                 key=f"out_sigtot_{oi}",
                                                 help="Generira dodatni sheet s _sig_total — Total stupac se testira protiv svake kategorije")
 
+            # ── Total specifično: značajnost između opcija ──
+            if out_type == 'total':
+                st.session_state.setdefault(f'out_btw_{oi}', True)
+                show_between_options = st.checkbox(
+                    "Značajnost između opcija (z-test 95%)",
+                    key=f"out_btw_{oi}",
+                    help="Generira dodatni _btw sheet — svaka opcija se uspoređuje sa "
+                         "svakom drugom unutar istog pitanja na Total bazi. "
+                         "Single-response: zavisni udjeli; multi-response: McNemar.",
+                )
+
             # ── Odabir tablica (za oba tipa) ──
             if table_options:
                 tbl_mode = st.radio(
@@ -3658,6 +3685,8 @@ def main():
                 out_def['banner_vars'] = [cat_var_names[bi] for bi in banner_vars_sel]
                 out_def['show_sig'] = show_sig
                 out_def['show_sig_total'] = show_sig_total
+            if out_type == 'total':
+                out_def['show_between_options'] = show_between_options
             output_defs.append(out_def)
 
     bc1, bc2, _ = st.columns([1, 1, 4])
@@ -3747,7 +3776,8 @@ def main():
         if od['type'] == 'total':
             nt = len(od.get('table_indices', []))
             tbl_str = f" ({nt} tablica)" if nt < len(table_options) else ""
-            out_summary.append(f"**{od['sheet_name']}** — Total{tbl_str}{filt_str}")
+            btw_str = " + _btw" if od.get('show_between_options', True) else ""
+            out_summary.append(f"**{od['sheet_name']}** — Total{tbl_str}{btw_str}{filt_str}")
         else:
             nb = len(od.get('banner_vars', []))
             nt = len(od.get('table_indices', []))
@@ -3902,6 +3932,28 @@ def main():
                 total_tables += len(tables)
                 all_errors.extend(errs)
 
+                # ── Between-options značajnost (red-vs-red, Total baza) ──
+                between_blocks = []
+                if out_def.get('show_between_options', True):
+                    _bo_col_map = build_column_map(work_df)
+                    for _btbl in tables:
+                        _bidx = _btbl.get('_idx')
+                        if _bidx is None:
+                            continue
+                        _btype = get_table_type(titles[_bidx])
+                        _btitle = get_table_title(titles[_bidx])
+                        _bo_results = compute_between_options(
+                            work_df, _btype, variables[_bidx], _btbl, meta,
+                            _bo_col_map, weight_col)
+                        if _bo_results:
+                            between_blocks.append({
+                                'title': _btitle,
+                                'q_code': _extract_q_code_from_title(_btitle),
+                                'table_type': _btype,
+                                'table_idx': _bidx,
+                                'results': _bo_results,
+                            })
+
                 # Piši u privremeni fajl pa kopiraj sheetove
                 import tempfile as _tmpmod
                 with _tmpmod.NamedTemporaryFile(suffix='.xlsx', delete=False) as _tf:
@@ -4015,6 +4067,50 @@ def main():
                             n_data = len(tbl['rows'])
                             has_caption = bool(tbl.get('caption', ''))
                             _toc_r += 1 + 1 + n_data + (1 if has_caption else 0) + 1
+
+                # ── Between-options sig sheet (Total baza) ──
+                if between_blocks:
+                    _btw_base = out_def['sheet_name'][:27] + '_btw'
+                    btw_name = _unique_name(_btw_base)
+                    _btw_ws = write_between_options_sheet(
+                        wb, btw_name, between_blocks, design=table_design)
+                    if _btw_ws is not None and ai_meta is not None:
+                        ai_meta.add(
+                            'SHEETS', sheet_name=btw_name, role='between_options',
+                            output_id=output_id, base_sheet_name=sname,
+                            table_block_count=len(between_blocks), hidden=False,
+                        )
+                        for _blk in between_blocks:
+                            _b_idx = _blk['table_idx']
+                            _b_metric = _table_metric_type(_blk['table_type'], _blk['title'])
+                            _b_tnum = f'{int(_b_idx) + start_num}.1'
+                            for _pair in _blk['results']:
+                                ai_meta.add(
+                                    'BETWEEN_OPTIONS',
+                                    output_id=output_id,
+                                    source_sheet=sname,
+                                    between_sheet=btw_name,
+                                    table_idx=_b_idx,
+                                    table_number=_b_tnum,
+                                    q_code=_blk['q_code'],
+                                    title=_blk['title'],
+                                    table_type_code=_blk['table_type'],
+                                    metric_type=_b_metric,
+                                    scope='total',
+                                    axis='Total',
+                                    base_n=_pair['n'],
+                                    option_a_label=_pair['option_a_label'],
+                                    option_a_value=_pair['option_a_value'],
+                                    option_b_label=_pair['option_b_label'],
+                                    option_b_value=_pair['option_b_value'],
+                                    significant=_pair['significant'],
+                                    direction=_pair['direction'],
+                                    test=_pair['test'],
+                                    confidence=_pair['confidence'],
+                                    b_a_not_b=_pair.get('b_a_not_b', ''),
+                                    c_b_not_a=_pair.get('c_b_not_a', ''),
+                                    note=_pair.get('note', ''),
+                                )
 
                 _twb.close()
                 os.unlink(_tf_path)
