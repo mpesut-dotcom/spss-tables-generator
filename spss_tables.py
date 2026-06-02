@@ -247,9 +247,19 @@ def make_mr_table(df, var_string, meta, col_map, mr_type='k', weight_col=None):
     var_names_raw = parse_mr_vars(var_string)
     var_names = [resolve_col(v, df, col_map) for v in var_names_raw]
 
-    # Total cases: ispitanici s barem jednim ne-missing odgovorom
+    # Total cases:
+    #  - 'k' (MRGROUP): ispitanik je u bazi samo ako ima BAREM JEDAN ne-nula,
+    #    ne-missing kod. Vrijednost 0 znaci 'prazan slot' (vec se ignorira u
+    #    all_vals.discard(0)), pa svi-0 ispitanici nisu spomenuli nista i
+    #    ne ulaze u bazu — inace se baza umjetno naduva kad data-prep upise
+    #    0 za ispitanike koji nisu dobili pitanje (npr. filter/skip).
+    #  - 'd' (MDGROUP): svi-0 znaci 'nije izabrao nijednu opciju' = valjan
+    #    odgovor, pa ostaje "barem jedan ne-missing".
     mr_df = df[var_names]
-    valid_mask = mr_df.notna().any(axis=1)
+    if mr_type == 'k':
+        valid_mask = (mr_df.notna() & (mr_df != 0)).any(axis=1)
+    else:
+        valid_mask = mr_df.notna().any(axis=1)
     use_weight = weight_col and weight_col in df.columns
 
     if use_weight:
@@ -770,8 +780,13 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
     actual_break = resolve_col(break_var, df, col_map)
     break_labels = get_value_labels(actual_break, meta)
 
+    # Valid mask (vidi make_mr_table za detalje):
+    #  'k' iskljucuje svi-0 ispitanike, 'd' ostaje notna-any.
     mr_df = df[var_names]
-    valid_mask = mr_df.notna().any(axis=1)
+    if mr_type == 'k':
+        valid_mask = (mr_df.notna() & (mr_df != 0)).any(axis=1)
+    else:
+        valid_mask = mr_df.notna().any(axis=1)
     subset = df[valid_mask].copy()
     use_weight = weight_col and weight_col in subset.columns
 
@@ -782,32 +797,22 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
     col_labels = [label_for_value(bv, break_labels) for bv in break_vals] + ['Total']
     col_letters = SIG_LETTERS[:len(break_vals)]
 
-    # N row: full base (all respondents with valid banner), matching SPSS CTABLES
-    base = df[df[actual_break].notna()]
+    # N red + nazivnici postotaka: MR-valjani ispitanici po banner stupcu.
+    # Konzistentno s 's' simple crosstab — prikazani N je stvarna baza pitanja
+    # (isti broj koji se koristi za postotke), a ne puni banner-base.
+    # (Prije se col_ns racunao nad "df[banner.notna()]" sto je davalo napuhanu
+    # bazu kad MR-pitanje nije postavljeno svim respondentima.)
     col_ns = []
-    for bv in break_vals:
-        mask = base[actual_break] == bv
-        if use_weight:
-            col_ns.append(float(base.loc[mask, weight_col].sum()))
-        else:
-            col_ns.append(int(mask.sum()))
-    if use_weight:
-        col_ns.append(float(base[weight_col].sum()))
-    else:
-        col_ns.append(len(base))
-
-    # Percentage denominators: MR-valid respondents per column (subset of base)
-    pct_denoms = []
     for bv in break_vals:
         mask = subset[actual_break] == bv
         if use_weight:
-            pct_denoms.append(float(subset.loc[mask, weight_col].sum()))
+            col_ns.append(float(subset.loc[mask, weight_col].sum()))
         else:
-            pct_denoms.append(int(mask.sum()))
+            col_ns.append(int(mask.sum()))
     if use_weight:
-        pct_denoms.append(float(subset[weight_col].sum()))
+        col_ns.append(float(subset[weight_col].sum()))
     else:
-        pct_denoms.append(len(subset))
+        col_ns.append(len(subset))
 
     if mr_type == 'k':
         # MRGROUP: rows = unique values across all variables
@@ -833,14 +838,14 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / pct_denoms[ci] * 100, 5) if pct_denoms[ci] > 0 else 0.0
+                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / pct_denoms[-1] * 100, 5) if pct_denoms[-1] > 0 else 0.0
+            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
     else:
@@ -856,18 +861,18 @@ def make_crosstab_mr(df, var_string, break_var, meta, col_map, mr_type='k', weig
                     n = float(subset.loc[combined, weight_col].sum())
                 else:
                     n = int(combined.sum())
-                pct = round(n / pct_denoms[ci] * 100, 5) if pct_denoms[ci] > 0 else 0.0
+                pct = round(n / col_ns[ci] * 100, 5) if col_ns[ci] > 0 else 0.0
                 row_pcts.append(pct)
             # Total
             if use_weight:
                 n_total = float(subset.loc[item_mask, weight_col].sum())
             else:
                 n_total = int(item_mask.sum())
-            pct_total = round(n_total / pct_denoms[-1] * 100, 5) if pct_denoms[-1] > 0 else 0.0
+            pct_total = round(n_total / col_ns[-1] * 100, 5) if col_ns[-1] > 0 else 0.0
             row_pcts.append(pct_total)
             pct_matrix.append(row_pcts)
 
-    sig_matrix = _compute_sig_pct(pct_matrix, pct_denoms, col_letters, len(break_vals))
+    sig_matrix = _compute_sig_pct(pct_matrix, col_ns, col_letters, len(break_vals))
 
     return {
         'type': 'mr',
@@ -1790,8 +1795,8 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
         col_letter = get_column_letter(ci + 2)
         ws.column_dimensions[col_letter].width = 14
 
-    if start_row == 1:
-        ws.freeze_panes = 'B4' if show_sig else 'B3'
+    # Note: no freeze_panes on banner/crosstab sheets — researchers prefer to
+    # scroll freely (the banner labels are repeated above each table block).
 
     return row_num
 
