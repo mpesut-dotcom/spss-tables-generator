@@ -908,10 +908,12 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
     sd_matrix = []    # za sig test
     n_matrix = []     # N po celiji
 
+    used_vars = []
     for vname in var_names:
         vals = pd.to_numeric(df[vname], errors='coerce')
         if not vals.notna().any():
             continue
+        used_vars.append(vname)
         row_labels.append(get_var_label(vname, meta))
 
         row_means = []
@@ -993,8 +995,24 @@ def make_crosstab_numeric(df, var_string, break_var, meta, col_map,
             sig_row.append(letters)
         sig_matrix.append(sig_row)
 
-    # col_ns = N za prvi red (ili agregirano)
-    col_ns = n_matrix[0] if n_matrix else [0] * (num_break + 1)
+    # col_ns = baza bloka po stupcu: ispitanici s vrijednoscu na barem jednoj varijabli bloka (Total zadnji).
+    # Do 2026-09-24 ovo je bio n_matrix[0], baza PRVE varijable - pod "sp1 by sp4" redak N je nosio bazu
+    # Kaufland ocjene za svaki segment (agent hendal, ticket #76). Baza svake ocjene je u n_matrix[red].
+    if used_vars:
+        any_mask = pd.concat([pd.to_numeric(df[v], errors='coerce').notna() for v in used_vars], axis=1).any(axis=1)
+    else:
+        any_mask = pd.Series(False, index=df.index)
+    col_ns = []
+    for bv in break_vals:
+        mask = any_mask & (df[actual_break] == bv)
+        if use_weight:
+            col_ns.append(_round_n(float(df.loc[mask, weight_col].sum())))
+        else:
+            col_ns.append(int(mask.sum()))
+    if use_weight:
+        col_ns.append(_round_n(float(df.loc[any_mask, weight_col].sum())))
+    else:
+        col_ns.append(int(any_mask.sum()))
 
     return {
         'type': 'numeric',
@@ -1393,6 +1411,8 @@ def merge_crosstabs_banner(crosstabs):
         _raw_sds = [row[first_n_break] for row in first.get('sd_matrix', [])]
         # Pad total_sds to same length as total_means to prevent IndexError
         total_sds = _raw_sds + [0.0] * (len(total_means) - len(_raw_sds))
+        # the Total N of every row (each mean has its own base - ticket #76)
+        total_ns = [row[first_n_break] for row in first.get('n_matrix', [])]
     else:
         total_pcts = [row[first_n_break] for row in first['pct_matrix']]
 
@@ -1406,6 +1426,7 @@ def merge_crosstabs_banner(crosstabs):
     if is_numeric:
         banner['total_means'] = total_means
         banner['total_sds'] = total_sds
+        banner['total_ns'] = total_ns
     else:
         banner['total_pcts'] = total_pcts
 
@@ -1461,8 +1482,11 @@ def compute_sig_total_banner(banner):
         if is_numeric:
             total_val = banner['total_means'][ri]
             total_sd = banner.get('total_sds', [0] * n_rows)[ri]
+            _tns = banner.get('total_ns', [])
+            total_n_row = _tns[ri] if ri < len(_tns) and _tns[ri] else total_n   # the row's own base (ticket #76)
         else:
             total_val = banner['total_pcts'][ri]
+            total_n_row = total_n
 
         for grp in groups:
             n_cols = len(grp['col_labels'])
@@ -1477,7 +1501,7 @@ def compute_sig_total_banner(banner):
                     col_sd = _sd_fallback[ri][ci] if ri < len(_sd_fallback) and ci < len(_sd_fallback[ri]) else 0
                     col_n_i = _n_fallback[ri][ci] if ri < len(_n_fallback) and ci < len(_n_fallback[ri]) else 0
                     z = _mean_sig(total_val, col_val, total_sd, col_sd,
-                                  total_n, col_n_i if col_n_i else col_n)
+                                  total_n_row, col_n_i if col_n_i else col_n)
                 else:
                     col_val = grp['pct_matrix'][ri][ci]
                     z = _col_pct_sig(total_val, col_val, total_n, col_n)
@@ -1748,29 +1772,44 @@ def write_banner_to_sheet(ws, banner, title_str, start_row=1, show_sig=True,
 
         row_num += 1
 
-    # ── N row ──
-    cell = ws.cell(row=row_num, column=1, value='N')
-    cell.font = base_font
-    cell.border = n_border
-    cell.fill = n_fill
-    # Total N first (column 2)
-    cell = ws.cell(row=row_num, column=2, value=round(banner['total_n']))
-    cell.font = base_font
-    cell.border = n_border
-    cell.fill = n_fill
-    cell.alignment = Alignment(horizontal='right')
-    col_offset = 3
-    for gi, grp in enumerate(groups):
-        for ci, n in enumerate(grp['col_ns']):
-            cell = ws.cell(row=row_num, column=col_offset + ci, value=round(n))
-            cell.font = base_font
-            cell.border = n_border
-            cell.fill = n_fill
-            cell.alignment = Alignment(horizontal='right')
-            if ci == 0:
-                cell.border = Border(left=_sep, top=_sep, bottom=_strong)
-        col_offset += len(grp['col_labels'])
-    row_num += 1
+    # ── N row(s) ──
+    # A numeric block with several variables gets one N row per variable ("N: <label>"): each mean has its
+    # own base (the 99 'Ne znam' of a satisfaction grid drops per chain). One variable, or a pct block,
+    # keeps the single N row = the block's base per column. (agent hendal ticket #76, 2026-09-24)
+    if is_numeric and len(row_labels) > 1:
+        _tns = banner.get('total_ns', [])
+        n_row_specs = []
+        for ri, _lbl in enumerate(row_labels):
+            _per_group = []
+            for grp in groups:
+                _nm = grp.get('n_matrix', [])
+                _per_group.append(_nm[ri] if ri < len(_nm) else [None] * len(grp['col_labels']))
+            n_row_specs.append((f"N: {_lbl}", _tns[ri] if ri < len(_tns) else None, _per_group))
+    else:
+        n_row_specs = [('N', banner['total_n'], [grp['col_ns'] for grp in groups])]
+    for _lbl, _tot, _per_group in n_row_specs:
+        cell = ws.cell(row=row_num, column=1, value=_lbl)
+        cell.font = base_font
+        cell.border = n_border
+        cell.fill = n_fill
+        # Total N first (column 2)
+        cell = ws.cell(row=row_num, column=2, value=round(_tot) if _tot is not None else None)
+        cell.font = base_font
+        cell.border = n_border
+        cell.fill = n_fill
+        cell.alignment = Alignment(horizontal='right')
+        col_offset = 3
+        for gi, grp in enumerate(groups):
+            for ci, n in enumerate(_per_group[gi]):
+                cell = ws.cell(row=row_num, column=col_offset + ci, value=round(n) if n is not None else None)
+                cell.font = base_font
+                cell.border = n_border
+                cell.fill = n_fill
+                cell.alignment = Alignment(horizontal='right')
+                if ci == 0:
+                    cell.border = Border(left=_sep, top=_sep, bottom=_strong)
+            col_offset += len(grp['col_labels'])
+        row_num += 1
 
     # ── Caption ──
     caption = banner.get('caption', '')
