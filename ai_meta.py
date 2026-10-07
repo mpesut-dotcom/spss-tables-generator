@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""_AI_META — the hidden metadata sheet the AI context exporter reads (Raspisivanje slajdova, schema v3.4).
+"""_AI_META — the metadata sheet the AI context exporter reads (visible since 2026-10-07, the owner's word: the researcher sees what the report gate reads; hidden before) (Raspisivanje slajdova, schema v3.4).
 
 ONE writer for both entry points. app.py ("Generiraj tablice") and headless.py (po.json replay)
 call the same AiMetaWriter hooks at the same points of their generate loops; neither file holds
@@ -258,7 +258,7 @@ class AiMetaBuilder:
             raise KeyError(section)
         self.sections[section].append(row)
 
-    def write_to_workbook(self, wb, sheet_name='_AI_META', hidden=True):
+    def write_to_workbook(self, wb, sheet_name='_AI_META', hidden=False):
         if sheet_name in wb.sheetnames:
             del wb[sheet_name]
         ws = wb.create_sheet(sheet_name)
@@ -1223,6 +1223,6 @@ class AiMetaWriter:
         self.builder.add(
             'SHEETS', sheet_name=AI_META_SHEET_NAME, role='ai_meta',
             output_id='', base_sheet_name='', table_block_count=0,
-            hidden=True,
+            hidden=False,
         )
-        return self.builder.write_to_workbook(wb, sheet_name=AI_META_SHEET_NAME, hidden=True)
+        return self.builder.write_to_workbook(wb, sheet_name=AI_META_SHEET_NAME, hidden=False)

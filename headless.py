@@ -1,6 +1,6 @@
 """Headless/API ulaz za Hendalice: pokreni spremljeni _po.json plan obrade bez Streamlita.
 
-CLI (isto sto i gumb "Generiraj tablice" u app.py, ukljucujuci skriveni _AI_META sheet
+CLI (isto sto i gumb "Generiraj tablice" u app.py, ukljucujuci vidljivi _AI_META sheet (zadnji u knjizi; skriven do 2026-10-07)
 kad plan kaze global.add_ai_meta=true ili --ai-meta on):
 
     python headless.py --sav data_v5.sav --input input.txt --po data_v5_po.json
@@ -469,7 +469,7 @@ def main() -> int:
                         help="between-options sig sheets (auto = po po.json/app defaultu)")
     parser.add_argument("--toc", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--ai-meta", choices=["auto", "on", "off"], default="auto",
-                        help="skriveni _AI_META sheet za AI context exporter (auto = global.add_ai_meta iz po.json)")
+                        help="vidljivi _AI_META sheet (zadnji u knjizi) za AI context exporter (auto = global.add_ai_meta iz po.json)")
     args = parser.parse_args()
 
     toc = None if args.toc == "auto" else args.toc == "on"

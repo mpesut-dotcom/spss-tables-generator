@@ -1909,8 +1909,8 @@ def main():
     st.subheader("📑 Table of Contents")
     add_toc = st.checkbox("Dodaj TOC sheet (BETA)", key="add_toc",
                           help="Dodaje početni sheet s popisom svih tablica i linkovima")
-    add_ai_meta = st.checkbox("Dodaj AI META sheet (skriven)", key="add_ai_meta",
-                              help="Dodaje skriveni _AI_META sheet za AI context exporter")
+    add_ai_meta = st.checkbox("Dodaj AI META sheet (vidljiv)", key="add_ai_meta",
+                              help="Dodaje vidljivi _AI_META sheet (zadnji u knjizi) za AI context exporter i izvjestaj; kopija za klijenta (_client) ga nema")
 
     if add_ai_meta:
         st.subheader("🤖 AI META")
